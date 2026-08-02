@@ -1,0 +1,3 @@
+requests>=2.32.0
+# 可选：更强的 TLS 指纹以降低被 WAF 识别的概率（无则退回 requests）
+curl_cffi>=0.13.0

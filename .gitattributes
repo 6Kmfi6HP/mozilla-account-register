@@ -1,0 +1,13 @@
+# 确保跨平台文本换行一致
+* text=auto
+
+# 批量注册运行时会生成这些敏感产物，强制排除
+config.json
+mail_credentials.txt
+accounts_*.txt
+*.pending.jsonl
+*.lock
+
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf

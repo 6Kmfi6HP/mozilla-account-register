@@ -1,0 +1,22 @@
+{
+  "email_provider": "cloudmail",
+  "cloudmail_api_base": "",
+  "cloudmail_public_token": "",
+  "cloudmail_domains": "example.com",
+  "cloudmail_path_messages": "/api/public/emailList",
+  "auth_base": "https://api.accounts.firefox.com/v1",
+  "proxy": "",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+  "service": "sync",
+  "register_count": 1,
+  "register_threads": 1,
+  "thread_start_interval": 3,
+  "register_max_attempts": 10,
+  "mail_timeout": 180,
+  "mail_poll_interval": 3,
+  "mail_retry_count": 3,
+  "request_timeout": 30,
+  "account_hard_timeout": 900,
+  "emails_file": "",
+  "password_prefix": "Moz!"
+}
