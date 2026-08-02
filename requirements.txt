@@ -1,3 +1,7 @@
 requests>=2.32.0
 # 可选：更强的 TLS 指纹以降低被 WAF 识别的概率（无则退回 requests）
 curl_cffi>=0.13.0
+# 可选：浏览器后端（register.py --backend browser），绕过生产 WAF。
+# 需 Python 环境可运行 Chromium；未安装时该后端会给出明确报错，不影响 API 后端。
+# cloakbrowser>=0.4
+# playwright>=1.40

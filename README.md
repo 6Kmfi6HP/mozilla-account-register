@@ -2,7 +2,10 @@
 
 针对 **Mozilla 账号（Mozilla Accounts / 原 Firefox Accounts）** 的批量自动注册 CLI。
 
-Mozilla 账号注册是**纯 HTTP API 流程**，无需浏览器自动化：客户端派生 `authPW` → `POST /account/create` → 从临时邮箱自动取验证码 → `POST /recovery_email/verify_code` 完成验证。
+提供**两个注册后端**：
+
+- **API 后端（默认）**：纯 HTTP onepw 协议。客户端派生 `authPW` → `POST /account/create` → 从临时邮箱自动取验证码 → `POST /recovery_email/verify_code` 完成验证。
+- **浏览器后端（`--backend browser`）**：cloakbrowser 反检测浏览器走真实注册页。生产环境 Auth Server 对 POST 有 Fastly WAF（`Client Challenge`），纯 HTTP 创建账号可能被 406 拦截，此后端可稳定绕过。
 
 ## 特性
 
@@ -11,6 +14,8 @@ Mozilla 账号注册是**纯 HTTP API 流程**，无需浏览器自动化：客�
 - ✅ 批量注册：文本邮箱列表 或 自动生成邮箱 + 随机密码
 - ✅ 多线程并发 + 错峰启动，输出逐行 fsync 落盘不丢
 - ✅ `authPW` 派生与 Mozilla 官方 onepw v1 协议字节级一致（已用官方测试向量验证）
+- ✅ **浏览器后端**自动处理：Client Challenge 绕过、注册验证码、改设置二次验证码、设置密码（账号可直接用邮箱+密码登录）
+- ✅ 真实端到端验证通过（浏览器后端注册的账号已用邮箱+密码重新登录确认可用）
 
 ## 快速开始
 
@@ -24,11 +29,15 @@ cp config.example.json config.json
 # 3. 干跑：校验配置 + 测试 authPW 派生，不发网络请求
 python register.py --dry-run
 
-# 4. 注册 3 个账号（自动生成临时邮箱 + 随机密码）
+# 4. 注册 3 个账号（API 后端，自动生成临时邮箱 + 随机密码）
 python register.py --count 3
 
 # 5. 从文件批量注册
 python register.py --emails emails.txt --threads 2
+
+# 6. 浏览器后端（绕过生产 WAF；需先装 cloakbrowser）
+pip install cloakbrowser
+python register.py --backend browser --count 1
 ```
 
 ## 配置
@@ -58,20 +67,24 @@ python register.py [选项]
   --emails FILE    邮箱列表文件，每行一个邮箱
   --threads N      并发线程数（覆盖配置）
   --out FILE       账号输出文件（默认 accounts_<时间戳>.txt）
+  --backend X      api | browser（默认 api；browser 需安装 cloakbrowser）
   --dry-run        只校验配置与 authPW 派生，不发网络请求
 ```
 
+> 提示：若生产 API 被 WAF 拦截（HTTP 406），请改用 `--backend browser`。
+
 ## 输出
 
-- **账号**：`accounts_<YYYYMMDD_HHMMSS>.txt`，格式 `邮箱----密码----uid`（逐行 fsync 实时追加）
+- **账号**：`accounts_<YYYYMMDD_HHMMSS>.txt`，格式 `邮箱----密码----uid`（逐行 fsync 实时追加；浏览器后端 extra 记为 `browser-verified`）
 - **邮箱凭证**：`mail_credentials.txt`，格式 `邮箱\t凭证`（可回读）
 
 ## 模块结构
 
 ```
 mozilla-account-register/
-├── register.py           # CLI 入口：批量编排、并发、参数解析
-├── register_mozilla.py   # 单账号注册流程（派生→创建→取码→验证）
+├── register.py           # CLI 入口：批量编排、并发、参数解析、后端分派
+├── register_mozilla.py   # API 后端单账号注册（派生→创建→取码→验证）
+├── register_browser.py   # 浏览器后端（cloakbrowser 注册页 + 验证码 + 设密码）
 ├── mozilla_api.py        # Auth Server v1 客户端（/account/create、verify_code）
 ├── mozilla_crypto.py     # onepw v1 派生（PBKDF2 1000 轮 + HKDF）
 ├── mail_service.py       # cloudmail 邮箱 API + 验证码提取
@@ -83,6 +96,8 @@ mozilla-account-register/
 ```
 
 ## 工作原理
+
+### API 后端
 
 ```
 [邮箱生成] cloudmail 随机生成 email@domain
@@ -102,6 +117,27 @@ mozilla-account-register/
    ▼
 [输出]      accounts_<时间戳>.txt: email----password----uid
 ```
+
+### 浏览器后端
+
+```
+[启动] cloakbrowser 反检测浏览器（绕过 Fastly Client Challenge）
+   │
+   ▼
+[注册页] 填邮箱 → 提交 → Mozilla 发 6 位验证码邮件
+   │
+   ▼
+[确认]   cloudmail 取码 → 填入 → Confirm → 账号创建并自动登录 /settings
+   │
+   ▼
+[设密码] settings/create_password → 二次验证码（confirmationCode）→ 填入
+   │          → 填新密码+确认密码 → Save → "Password set"
+   │
+   ▼
+[输出]    accounts_<时间戳>.txt: email----password----browser-verified
+```
+
+> 二次验证码输入框 name 为 `confirmationCode`，密码框可能被可见性图标覆盖需 `force` fill——这些细节已在 `register_browser.py` 内处理。
 
 ## 验证与测试
 

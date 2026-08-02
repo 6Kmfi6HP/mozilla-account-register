@@ -14,6 +14,12 @@ import json
 import time
 from typing import Optional
 
+# 传输层：优先用 curl_cffi 的 Chrome TLS 指纹（绕过 Fastly WAF），
+# 无 curl_cffi 时退回 requests（弱指纹，可能被 WAF 拦）。
+try:
+    from curl_cffi import requests as _cffi_requests
+except Exception:  # pragma: no cover - 依赖可选
+    _cffi_requests = None
 import requests
 
 AUTH_BASE = "https://api.accounts.firefox.com/v1"
@@ -47,10 +53,17 @@ class MozillaAuthClient:
         user_agent: Optional[str] = None,
         proxy: Optional[str] = None,
         timeout: int = 30,
+        impersonate: bool = True,
     ):
         self.base = base.rstrip("/")
         self.timeout = timeout
-        self.session = requests.Session()
+        self.impersonate = impersonate
+        # 优先 curl_cffi Session（Chrome 指纹），否则 requests Session
+        if impersonate and _cffi_requests is not None:
+            self.session = _cffi_requests.Session()
+            self.session.impersonate = "chrome"
+        else:
+            self.session = requests.Session()
         if user_agent:
             self.session.headers["User-Agent"] = user_agent
         if proxy:
@@ -68,6 +81,9 @@ class MozillaAuthClient:
                 method, url, json=payload, headers=headers, timeout=self.timeout
             )
         except requests.RequestException as exc:
+            raise MozillaAuthError(f"请求失败: {url}: {exc}") from exc
+        except Exception as exc:
+            # curl_cffi 的异常类型不是 requests.RequestException
             raise MozillaAuthError(f"请求失败: {url}: {exc}") from exc
 
         text = resp.text

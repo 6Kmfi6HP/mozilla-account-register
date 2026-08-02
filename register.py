@@ -7,9 +7,10 @@
   - 并发控制（register_threads）
 
 用法：
-  python register.py                       # 按 config.json 注册 register_count 个
+  python register.py                       # 按 config.json 注册 register_count 个（API 后端）
   python register.py --count 5             # 注册 5 个
   python register.py --emails emails.txt   # 批量注册文件中的邮箱
+  python register.py --backend browser     # 用浏览器后端（绕过生产 WAF，需 cloakbrowser）
   python register.py --dry-run             # 只跑派生+参数校验，不发请求
 """
 from __future__ import annotations
@@ -28,8 +29,8 @@ from app_config import load_config, validate_config
 from app_paths import default_accounts_path
 import mail_service
 import mozilla_api
+import register_browser
 from register_mozilla import register_one
-
 _LOCK = threading.Lock()
 _OUTPUT_LINE_PREFIXES = ("[+]", "[*]", "[!]", "[Debug]", "---")
 
@@ -68,17 +69,43 @@ def _run_one(
     account_path: str,
     mail_credential_dir: str,
     auth_client: Optional[mozilla_api.MozillaAuthClient],
+    backend: str = "api",
 ):
     try:
-        result = register_one(
-            email=email,
-            password=None,
-            config=config,
-            auth_client=auth_client,
-            log_callback=log,
-            account_path=account_path,
-            mail_credential_dir=mail_credential_dir,
-        )
+        if backend == "browser":
+            if email is None:
+                # 浏览器后端需要显式邮箱；从 cloudmail 生成临时邮箱
+                email, credential = mail_service.get_email_and_token()
+                log(f"[*] 已生成临时邮箱: {email}")
+                if mail_credential_dir:
+                    from account_outputs import save_mail_credential
+
+                    save_mail_credential(mail_credential_dir, email, credential)
+            result = register_browser.register_one_browser(
+                email=email,
+                password=generate_password(),
+                config=config,
+                log_callback=log,
+            )
+            if result and account_path:
+                from account_outputs import append_account_line
+
+                append_account_line(
+                    account_path,
+                    result["email"],
+                    result["password"],
+                    "browser-verified",
+                )
+        else:
+            result = register_one(
+                email=email,
+                password=None,
+                config=config,
+                auth_client=auth_client,
+                log_callback=log,
+                account_path=account_path,
+                mail_credential_dir=mail_credential_dir,
+            )
         return result
     except Exception as exc:
         log(f"[!] 注册失败 {email or '?'}: {exc}")
@@ -104,11 +131,13 @@ def register_batch(
     threads: int = 1,
     thread_start_interval: float = 3.0,
     cancel_callback: Optional[Callable[[], None]] = None,
+    backend: str = "api",
 ) -> int:
     """批量注册。返回成功数。
 
     emails 为 None 时按 config.register_count 生成临时邮箱。
-    每线程一个 auth client（各自独立 Session/Cookie）。
+    每线程一个 auth client（各自独立 Session/Cookie）；
+    backend=browser 时走 cloakbrowser 注册页（每线程独立浏览器实例）。
     """
     if emails is not None and emails:
         work: List[Optional[str]] = list(emails)
@@ -129,12 +158,14 @@ def register_batch(
 
     def worker():
         nonlocal index
-        client = mozilla_api.MozillaAuthClient(
-            base=config.get("auth_base", mozilla_api.AUTH_BASE),
-            user_agent=config.get("user_agent", ""),
-            proxy=config.get("proxy", ""),
-            timeout=int(config.get("request_timeout", 30) or 30),
-        )
+        client = None
+        if backend == "api":
+            client = mozilla_api.MozillaAuthClient(
+                base=config.get("auth_base", mozilla_api.AUTH_BASE),
+                user_agent=config.get("user_agent", ""),
+                proxy=config.get("proxy", ""),
+                timeout=int(config.get("request_timeout", 30) or 30),
+            )
         try:
             while True:
                 with index_lock:
@@ -154,12 +185,14 @@ def register_batch(
                     account_path,
                     mail_credential_dir,
                     auth_client=client,
+                    backend=backend,
                 )
                 if result:
                     with results_lock:
                         results.append(result)
         finally:
-            client.close()
+            if client is not None:
+                client.close()
 
     thread_list = []
     for _ in range(max(1, threads)):
@@ -208,6 +241,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--threads", type=int, default=None, help="并发线程数（覆盖配置）")
     parser.add_argument("--out", default=None, help="账号输出文件（默认 accounts_<时间戳>.txt）")
     parser.add_argument("--dry-run", action="store_true", help="只校验配置与派生，不发请求")
+    parser.add_argument(
+        "--backend",
+        choices=("api", "browser"),
+        default=None,
+        help="注册后端：api=纯 HTTP onepw 协议（默认，可能被 WAF 拦）；browser=cloakbrowser 注册页（需安装依赖）",
+    )
     args = parser.parse_args(argv)
 
     config = load_config(path=args.config)
@@ -237,6 +276,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         return _dry_run(config, log)
 
+    backend = args.backend or str(config.get("register_backend", "api") or "api")
+    if backend == "browser":
+        try:
+            register_browser._ensure_cloakbrowser()
+        except Exception as exc:
+            print(f"[!] {exc}", file=sys.stderr)
+            return 2
+
     if email_list is None and config.get("emails_file"):
         path = config.get("emails_file")
         if os.path.isfile(path):
@@ -250,6 +297,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     mail_credential_dir = "."
 
     log(f"[*] 输出文件: {account_path}")
+    log(f"[*] 注册后端: {backend}")
     threads = int(config.get("register_threads", 1) or 1)
     interval = float(config.get("thread_start_interval", 3) or 3)
 
@@ -261,6 +309,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         mail_credential_dir,
         threads=threads,
         thread_start_interval=interval,
+        backend=backend,
     )
     log(f"--- 完成: 成功 {ok} / 共 {(len(email_list) if email_list else int(config.get('register_count', 1) or 1))}")
     return 0 if ok > 0 else 1
