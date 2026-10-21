@@ -16,3 +16,6 @@ debug_*.png
 debug_*.log
 .idea/
 .vscode/
+fxpool-bundles/
+enrollment_attempts.txt
+renewal_credentials*.json

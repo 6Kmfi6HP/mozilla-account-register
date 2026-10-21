@@ -5,7 +5,7 @@
 提供**两个注册后端**：
 
 - **API 后端（默认）**：纯 HTTP onepw 协议。客户端派生 `authPW` → `POST /account/create` → 从临时邮箱自动取验证码 → `POST /recovery_email/verify_code` 完成验证。
-- **浏览器后端（`--backend browser`）**：cloakbrowser 反检测浏览器走真实注册页。生产环境 Auth Server 对 POST 有 Fastly WAF（`Client Challenge`），纯 HTTP 创建账号可能被 406 拦截，此后端可稳定绕过。
+- **浏览器后端（`--backend browser`）**：cloakbrowser 反检测浏览器走真实注册页。生产环境 Auth Server 对 POST 有 Fastly WAF（`Client Challenge`），纯 HTTP 创建账号可能被 406 拦截，此后端可稳定绕过；它还能从 `localStorage` 采集 FxA 会话，可选完成一次性开通，并把凭据桥接给 [fxpool-proxy](https://github.com/6Kmfi6HP/firefox-ip-protection-pool-go)，**让续期凭据的获取完全脱离 Firefox 浏览器**。
 
 ## 特性
 
@@ -14,8 +14,12 @@
 - ✅ 批量注册：文本邮箱列表 或 自动生成邮箱 + 随机密码
 - ✅ 多线程并发 + 错峰启动，输出逐行 fsync 落盘不丢
 - ✅ `authPW` 派生与 Mozilla 官方 onepw v1 协议字节级一致（已用官方测试向量验证）
-- ✅ **浏览器后端**自动处理：Client Challenge 绕过、注册验证码、改设置二次验证码、设置密码（账号可直接用邮箱+密码登录）
-- ✅ 真实端到端验证通过（浏览器后端注册的账号已用邮箱+密码重新登录确认可用）
+- ✅ **浏览器后端**按当前线上流程注册：邮箱 → 设置密码 → `Create account` → 6 位验证码 → `/settings`；密码框被 `input-label` 覆盖，自动使用 `force=True` 填充
+- ✅ 账号在服务端创建后**立即落盘** `email----password`，验证码迟到/失败也不会丢账号
+- ✅ 登录已有账号（`--signin`）时先快照邮箱，只接受新到达的验证码，避免旧注册码误用
+- ✅ 支持 `/signin_unblock` 的 8 位字母数字授权码（风控拦截场景）
+- ✅ 从 `localStorage["__fxa_storage.accounts"]` 采集 FxA 会话（不依赖 cookies / Firefox profile）
+- ✅ 可选一次性开通（`--enroll`），并写出 fxpool-proxy 可直接消费的凭据包 / `renewal_credentials.json`
 
 ## 快速开始
 
@@ -38,6 +42,16 @@ python register.py --emails emails.txt --threads 2
 # 6. 浏览器后端（绕过生产 WAF；需先装 cloakbrowser）
 pip install cloakbrowser
 python register.py --backend browser --count 1
+
+# 7. 浏览器后端 + 开通 + 为 fxpool-proxy 写凭据包
+python register.py --backend browser --count 1 --enroll --bundle-dir fxpool-bundles
+
+# 8. 注册机与代理同机：直接写 <root>/tokens/renewal_credentials.json
+python register.py --backend browser --count 1 --enroll --fxpool-root ~/.fxpool
+
+# 9. 已有账号：只登录生成会话/凭据，不创建新账号
+python register.py --backend browser --signin --emails accounts_20261021_120000.txt \
+  --enroll --fxpool-root ~/.fxpool
 ```
 
 ## 配置
@@ -46,37 +60,70 @@ python register.py --backend browser --count 1
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `email_provider` | 是 | `cloudmail`（当前支持） |
+| `email_provider` | 是 | `cloudmail`（当前默认且唯一随仓库提供的实现） |
 | `cloudmail_api_base` | 是 | Cloud Mail 服务地址 |
 | `cloudmail_public_token` | 是 | Cloud Mail 公共 Token |
 | `cloudmail_domains` | 是 | 收件域名，逗号分隔（随机轮换生成邮箱） |
 | `cloudmail_path_messages` | 否 | 邮件列表接口路径，默认 `/api/public/emailList` |
 | `auth_base` | 否 | Mozilla Auth Server，默认 `https://api.accounts.firefox.com/v1` |
 | `proxy` | 否 | HTTP 代理（批量高频时建议用代理池） |
+| `register_backend` | 否 | `api`（默认）或 `browser` |
 | `register_count` | 否 | 自动生成邮箱时注册数量 |
 | `register_threads` | 否 | 并发线程数 |
 | `mail_timeout` | 否 | 等待验证码超时（秒） |
+| `mail_poll_interval` | 否 | 邮箱轮询间隔（秒） |
 | `emails_file` | 否 | 邮箱列表文件路径（也支持 `--emails` CLI 参数） |
+| `fxpool_enroll` | 否 | 注册/登录后执行一次性开通（等价 `--enroll`） |
+| `fxpool_root` | 否 | 写入 `<PATH>/tokens/renewal_credentials.json`（等价 `--fxpool-root`；也可用环境变量 `FXPOOL_ROOT`） |
+| `bundle_dir` | 否 | 为每个账号写 `<DIR>/<uid>.json` 凭据包（等价 `--bundle-dir`，空=关闭） |
+
+`fxpool_enroll` / `fxpool_root` / `bundle_dir` 只在浏览器后端生效。配置里误留
+`fxpool_root` 不会影响 API 后端；但 `fxpool_enroll=true` 与 `register_backend=api`
+同时出现会直接报配置错误。
 
 ## 命令行
 
 ```
 python register.py [选项]
-  --config PATH    配置文件路径（默认 config.json）
-  --count N        注册数量（覆盖配置）
-  --emails FILE    邮箱列表文件，每行一个邮箱
-  --threads N      并发线程数（覆盖配置）
-  --out FILE       账号输出文件（默认 accounts_<时间戳>.txt）
-  --backend X      api | browser（默认 api；browser 需安装 cloakbrowser）
-  --dry-run        只校验配置与 authPW 派生，不发网络请求
+  --config PATH        配置文件路径（默认 config.json）
+  --count N            注册数量（覆盖配置）
+  --emails FILE        邮箱列表文件（--signin 时每行 email----password）
+  --threads N          并发线程数（覆盖配置）
+  --out FILE           账号输出文件（默认 accounts_<时间戳>.txt）
+  --backend X          api | browser（默认 api；browser 需安装 cloakbrowser）
+  --enroll             注册/登录后执行一次开通（每账号仅一次，不重试）
+  --fxpool-root PATH   写入 <PATH>/tokens/renewal_credentials.json
+  --bundle-dir DIR     为每个账号写 <DIR>/<uid>.json 凭据包
+  --no-bridge          不写凭据包与 renewal_credentials.json
+  --signin             只登录已有账号生成会话，不创建账号
+  --dry-run            只校验配置与 authPW 派生，不发网络请求
 ```
 
 > 提示：若生产 API 被 WAF 拦截（HTTP 406），请改用 `--backend browser`。
+> `--enroll`、`--fxpool-root`、`--bundle-dir`、`--no-bridge`、`--signin`
+> 只能与 `--backend browser` 一起使用。
+
+### 登录已有账号（`--signin`）
+
+`--signin` 读取的每行格式为 `email----password`（按第一个 `----` 分割，密码
+本身可以再包含 `----`）。本工具写出的 `accounts_<时间戳>.txt` 每行末尾还有
+第三个字段（`browser-verified`、`created-unverified` 或 API 后端的 32 位 uid），
+该字段会被自动识别并忽略，因此生成的文件可以直接回喂给 `--signin`。
+
+登录时会在提交密码前快照邮箱里已有的邮件 id，只接受之后到达的新验证码；
+如果 FxA 把登录路由到 `/signin_unblock`，则按 8 位字母数字授权码解析。
 
 ## 输出
 
-- **账号**：`accounts_<YYYYMMDD_HHMMSS>.txt`，格式 `邮箱----密码----uid`（逐行 fsync 实时追加；浏览器后端 extra 记为 `browser-verified`）
-- **邮箱凭证**：`mail_credentials.txt`，格式 `邮箱\t凭证`（可回读）
+- **账号**：`accounts_<YYYYMMDD_HHMMSS>.txt`，格式 `邮箱----密码----extra`
+  - 浏览器后端在点击 `Create account` 后立即写 `created-unverified`，整个浏览器
+    流程成功返回后原地更新为 `browser-verified`；
+  - API 后端 extra 为账号 uid。
+- **邮箱凭证**：`mail_credentials.txt`，格式 `邮箱\t凭证`（可回读）。
+- **凭据包**（可选）：`<bundle_dir>/<uid>.json`，键恰好为
+  `schema/email/uid/session_token`，权限 0600。
+- **fxpool 凭据**（可选）：`<fxpool_root>/tokens/renewal_credentials.json`，
+  紧凑 JSON、`schema` 为数字 1、权限 0600，目录 0700。
 
 ## 模块结构
 
@@ -84,7 +131,8 @@ python register.py [选项]
 mozilla-account-register/
 ├── register.py           # CLI 入口：批量编排、并发、参数解析、后端分派
 ├── register_mozilla.py   # API 后端单账号注册（派生→创建→取码→验证）
-├── register_browser.py   # 浏览器后端（cloakbrowser 注册页 + 验证码 + 设密码）
+├── register_browser.py   # 浏览器后端（注册/登录、会话采集、一次性开通）
+├── fxpool_bridge.py      # 凭据包 + renewal_credentials.json 发布（纯标准库）
 ├── mozilla_api.py        # Auth Server v1 客户端（/account/create、verify_code）
 ├── mozilla_crypto.py     # onepw v1 派生（PBKDF2 1000 轮 + HKDF）
 ├── mail_service.py       # cloudmail 邮箱 API + 验证码提取
@@ -118,26 +166,49 @@ mozilla-account-register/
 [输出]      accounts_<时间戳>.txt: email----password----uid
 ```
 
-### 浏览器后端
+### 浏览器后端（无 Firefox）
 
 ```
 [启动] cloakbrowser 反检测浏览器（绕过 Fastly Client Challenge）
    │
    ▼
-[注册页] 填邮箱 → 提交 → Mozilla 发 6 位验证码邮件
+[注册页] /signup 填邮箱 → 提交
    │
    ▼
-[确认]   cloudmail 取码 → 填入 → Confirm → 账号创建并自动登录 /settings
-   │
+[密码页] input[name=newPassword]（force fill）→ 点 "Create account"
+   │         账号在服务端创建，同时发送 6 位验证码邮件
+   │         立即写入 accounts_<时间戳>.txt: email----password----created-unverified
    ▼
-[设密码] settings/create_password → 二次验证码（confirmationCode）→ 填入
-   │          → 填新密码+确认密码 → Save → "Password set"
-   │
+[验证码] cloudmail 取码 → input[name=code]（force fill）→ Confirm
+   │         成功后落到 /settings（唯一成功信号），账号行更新为 browser-verified
+   ▼
+[采集会话] localStorage["__fxa_storage.accounts"]
+   │         → uid（32 hex）+ sessionToken（64 hex）
+   ▼
+[可选开通] 一次 GET https://vpn.mozilla.org/api/v1/fpn/auth
+   │         自动 302 到 /oauth/success，正文为权益 JSON
+   │         （每账号只尝试一次；429 不重试）
+   ▼
+[可选桥接] fxpool_bridge → <bundle_dir>/<uid>.json
+   │                     和/或 <fxpool_root>/tokens/renewal_credentials.json
    ▼
 [输出]    accounts_<时间戳>.txt: email----password----browser-verified
 ```
 
-> 二次验证码输入框 name 为 `confirmationCode`，密码框可能被可见性图标覆盖需 `force` fill——这些细节已在 `register_browser.py` 内处理。
+> 验证码输入框与密码框一样可能被 `input-label` 覆盖，两处都使用
+> `force=True`。登录路径会先快照邮箱中的旧邮件，避免把上一次注册的验证码
+> 当成新的登录码提交。
+
+### 与 fxpool-proxy 对接
+
+- 注册机生成凭据包后，在代理机执行：
+  `fxpool-proxy import-credentials <uid>.json --delete-source`
+  （也支持从 stdin 读取：`fxpool-proxy import-credentials - --no-verify`）
+- 同机运行时直接用 `--fxpool-root <fxpool 运行目录>`，fxpool-proxy 的
+  `token-status` / `token-refresh --force` / `usage` / `run` 会读取
+  `<root>/tokens/renewal_credentials.json`。
+- 凭据文件等同登录会话，**不要分享**；`fxpool-bundles/`、
+  `renewal_credentials*.json`、`enrollment_attempts.txt` 已在 `.gitignore` 中。
 
 ## 验证与测试
 
@@ -147,9 +218,11 @@ python -m unittest discover -s tests -q
 
 测试覆盖：
 - `authPW`/`unwrapBKey` 派生 vs **官方权威向量**（PyFxA + fxa-auth-client 交叉验证）
-- 验证码提取（contextual / 裸数字 / HTML 清洗 / 追踪段排除）
-- 配置加载与校验
-- 路径与输出格式
+- 验证码提取（contextual / 裸数字 / HTML 清洗 / 追踪段排除 / 8 位授权码）
+- 凭据包的键顺序、字节格式、0600/0700 权限、同 uid 覆盖与不同 uid 拒绝
+- `select_account_entry` 的 uid/email/currentAccountUid/lastLogin 选择规则
+- `accounts_*.txt` 解析与开通台账的一次性语义
+- 配置加载与校验、路径与输出格式
 
 ## 免责声明
 
