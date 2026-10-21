@@ -57,8 +57,17 @@ def _is_bundle(path: Path) -> bool:
     return isinstance(data, dict) and data.get("schema") == _SCHEMA
 
 
-def _import_one(bin_: str, bundle: Path, root: str, verify: bool, delete: bool) -> tuple[bool, str]:
+def _import_one(
+    bin_: str,
+    bundle: Path,
+    root: str,
+    verify: bool,
+    delete: bool,
+    account_mode: str | None = None,
+) -> tuple[bool, str]:
     args = [bin_, "import-credentials", str(bundle), "--root", root]
+    if account_mode:
+        args.extend(["--account-mode", account_mode])
     if not verify:
         args.append("--no-verify")
     if delete:
@@ -85,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fxpool-root", required=True, help="fxpool-proxy 工作目录（含 data/、store db）")
     p.add_argument("--fxpool-bin", default=None, help="fxpool-proxy 可执行文件路径")
     p.add_argument("--verify", action="store_true", help="导入时联网验证 token（默认离线）")
+    p.add_argument(
+        "--account-mode",
+        default=None,
+        help="传给 fxpool-proxy 的账号模式（多账号导入用 rr，写进 data/fxpool.db）",
+    )
     p.add_argument("--keep", action="store_true", help="导入成功后保留凭据包（默认删除）")
     p.add_argument("--dry-run", action="store_true", help="只列出凭据包不执行")
     args = p.parse_args(argv)
@@ -118,7 +132,9 @@ def main(argv: list[str] | None = None) -> int:
     delete = not args.keep
     ok = fail = 0
     for b in bundles:
-        success, msg = _import_one(bin_, b, root, args.verify, delete)
+        success, msg = _import_one(
+            bin_, b, root, args.verify, delete, args.account_mode
+        )
         if success:
             ok += 1
             print(f"[+] {b.name} ok")

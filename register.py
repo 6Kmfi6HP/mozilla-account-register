@@ -114,6 +114,10 @@ def _register_one_browser_attempt(
             from account_outputs import save_mail_credential
 
             save_mail_credential(mail_credential_dir, email, credential)
+    else:
+        # 外部提供的邮箱没有 new-email 基线：必须在提交注册表单（触发验证码
+        # 邮件）之前快照，否则 wait-code 会把收件箱里的旧营销邮件当新邮件。
+        mail_service.prepare_mail_baseline(email)
     created = {"email": None, "password": None}
 
     def _on_account_created(created_email: str, created_password: str) -> None:

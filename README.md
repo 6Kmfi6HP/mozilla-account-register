@@ -73,7 +73,8 @@ python register.py --backend browser --count 3
 | `cloudmail_path_messages` | 否 | 邮件列表接口路径，默认 `/api/public/emailList` |
 | `emailnator_script` | 否 | emailnator CLI 路径，默认 `~/.claude/skills/emailnator/emailnator.py` |
 | `emailnator_proxy` | 否 | emailnator 专用代理（优先级高于 `proxy` / `$EMAILNATOR_PROXY`；该后端强制走代理） |
-| `emailnator_state` | 否 | emailnator 已用验证码状态文件，默认由 CLI 决定（`~/.emailnator/used_codes.json`） |
+| `emailnator_state_dir` | 否 | 每个邮箱一个状态文件（旧邮件基线 + 已用验证码）的目录，默认 `~/.emailnator/states`。**不要改成共享文件**：并发注册会丢基线 |
+| `emailnator_code_pattern` | 否 | `wait-code` 的严格提取正则（含捕获组），默认只匹配 `Use 123456 to confirm your account` / `confirmation code: 123456`；空串退回 CLI 通用规则（营销邮件会被误判） |
 | `auth_base` | 否 | Mozilla Auth Server，默认 `https://api.accounts.firefox.com/v1` |
 | `proxy` | 否 | HTTP 代理（批量高频时建议用代理池） |
 | `browser_proxy` | 否 | 浏览器后端专用代理（优先级：`browser_proxy` > `proxy` > `$BROWSER_PROXY`）。**批量注册必填**——FxA 按出口 IP 限速 |
@@ -247,6 +248,10 @@ FxA 对注册接口按**出口 IP** 限速：同一 IP 反复注册会看到
   默认离线导入（传 `--no-verify`），并给 `fxpool-proxy` 传 `--delete-source`
   让它在导入成功后删掉凭据包；`--keep` 不传该参数、`--verify` 联网校验、
   `--dry-run` 只列清单。导入失败时凭据包保留以便重试。
+  **多账号导入必须加 `--account-mode rr`**（或设置环境变量 `ACCOUNT_MODE=rr`）：
+  否则第二个账号起会覆盖 `tokens/renewal_credentials.json`，而不是写进
+  `<root>/data/fxpool.db` 的账号池。`--account-mode` 会原样透传给
+  `fxpool-proxy import-credentials`。
 - 同机运行时直接用 `--fxpool-root <fxpool 运行目录>`，fxpool-proxy 的
   `token-status` / `token-refresh --force` / `usage` / `run` 会读取
   `<root>/tokens/renewal_credentials.json`。

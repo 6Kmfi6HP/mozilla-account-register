@@ -19,7 +19,10 @@ DEFAULT_CONFIG = {
     # 邮箱服务（emailnator 临时 Gmail）
     "emailnator_script": "~/.claude/skills/emailnator/emailnator.py",
     "emailnator_proxy": "",
-    "emailnator_state": "",
+    # 每个邮箱一个状态文件（基线 + 已用验证码）；共享文件会在并发下丢基线
+    "emailnator_state_dir": "~/.emailnator/states",
+    # wait-code 的严格提取正则（含捕获组）；空串退回 CLI 通用规则
+    "emailnator_code_pattern": r"(?:confirmation\s+code:\s*|use\s+)(\d{6})\b",
     # 网络
     "proxy": "",
     # 浏览器后端专用代理（FxA 对注册按出口 IP 限速，批量注册必须走代理）
@@ -137,7 +140,7 @@ def validate_config(cfg=None):
             raise ConfigError("配置项 register_backend 必须是 api 或 browser")
     if "fxpool_enroll" in data and type(data["fxpool_enroll"]) is not bool:
         raise ConfigError("配置项 fxpool_enroll 必须是布尔值 true/false")
-    for key in ("fxpool_root", "bundle_dir"):
+    for key in ("fxpool_root", "bundle_dir", "emailnator_state_dir", "emailnator_code_pattern"):
         if key in data and not isinstance(data[key], str):
             raise ConfigError(f"配置项 {key} 必须是字符串")
     return data

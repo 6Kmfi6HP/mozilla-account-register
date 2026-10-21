@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Callable, Dict, List, Optional
 
 import requests
@@ -333,6 +335,11 @@ def snapshot_mail_ids(email: str) -> set:
 
     登录已有账号前先做快照，轮询时用 ``ignore_ids`` 排除旧邮件，避免把上次
     注册/登录留下的验证码当成新码提交。
+
+    emailnator 下这个快照同时被写成该地址的基线状态文件：外部提供的邮箱
+    （``--emails`` / ``--signin``）没有经过 ``new-email``，不补基线的话
+    ``wait-code`` 会把收件箱里的营销邮件当成新邮件。已有基线时不覆盖
+    （重发回调里的快照只是扩大 ignore_ids）。
     """
     provider = get_email_provider()
     if provider == "emailnator":
@@ -340,7 +347,16 @@ def snapshot_mail_ids(email: str) -> set:
             messages = emailnator_get_messages(email)
         except Exception:
             return set()
-        return {str(msg.get("messageID") or msg.get("id")) for msg in messages if msg.get("messageID") or msg.get("id")}
+        ids = {
+            str(msg.get("messageID") or msg.get("id"))
+            for msg in messages
+            if msg.get("messageID") or msg.get("id")
+        }
+        try:
+            emailnator_seed_baseline(email, sorted(ids))
+        except OSError:
+            pass
+        return ids
     if provider != "cloudmail":
         return set()
     try:
@@ -357,9 +373,26 @@ def snapshot_mail_ids(email: str) -> set:
     return ids
 
 
+def prepare_mail_baseline(email: str) -> None:
+    """在触发验证码邮件之前记录该地址的基线（emailnator 专用，其他 provider 无操作）。
+
+    自动生成的地址由 ``new-email`` 自己写基线；只有外部提供的邮箱
+    （``--emails`` / ``--signin``）需要调用方在提交表单前显式补一次。
+    """
+    if get_email_provider() != "emailnator":
+        return
+    snapshot_mail_ids(email)
+
+
 # ---------------------------------------------------------------- emailnator
 
 DEFAULT_EMAILNATOR_SCRIPT = "~/.claude/skills/emailnator/emailnator.py"
+DEFAULT_EMAILNATOR_STATE_DIR = "~/.emailnator/states"
+# 只从"确认邮件"上下文里取码。CLI 用 --pattern 时严格匹配、不回退通用规则，
+# 因此营销邮件里的数字不会再被当成验证码（曾把 "All under 10 ..." 里的
+# 018982 当成注册码提交）。主题形如 "Use 445233 to confirm your account"，
+# 正文形如 "Use this confirmation code: 445233"，两种写法都能命中。
+DEFAULT_EMAILNATOR_CODE_PATTERN = r"(?:confirmation\s+code:\s*|use\s+)(\d{6})\b"
 
 
 def emailnator_script() -> str:
@@ -380,7 +413,94 @@ def emailnator_proxy() -> str:
     return ""
 
 
-def _emailnator_cmd(subcommand: str, *args) -> List[str]:
+def emailnator_state_dir() -> str:
+    """每个邮箱一个状态文件的目录。
+
+    共享一个状态文件时 ``_update_state`` 的"读整个 dict → 改 → 写回"会丢条目，
+    丢的正好是基线；没有基线的地址会把收件箱里的营销邮件当成新邮件，从里面
+    抓出 6 位数字当验证码。按地址分文件后每个文件只被一个注册流程读写。
+    """
+    raw = str(config.get("emailnator_state_dir", "") or "").strip()
+    return os.path.expanduser(raw or DEFAULT_EMAILNATOR_STATE_DIR)
+
+
+def emailnator_state_file(address: str) -> str:
+    """地址 → 状态文件路径（文件名可读，带短哈希避免清洗后撞名）。"""
+    key = str(address or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", key).strip("_")[:60] or "address"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(emailnator_state_dir(), f"{slug}-{digest}.json")
+
+
+def emailnator_code_pattern() -> str:
+    """传给 ``wait-code --pattern`` 的正则；配置成空串则退回 CLI 通用规则。"""
+    if "emailnator_code_pattern" not in config:
+        return DEFAULT_EMAILNATOR_CODE_PATTERN
+    return str(config.get("emailnator_code_pattern", "") or "").strip()
+
+
+def _read_emailnator_state(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_emailnator_state(path: str, state: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def emailnator_baseline_recorded(address: str) -> bool:
+    """该地址的基线是否已落盘。
+
+    ``new-email`` 的基线快照失败时不写条目，因此"有条目"就说明快照跑过了；
+    空白收件箱记录的是空列表，也是合法基线。不能用 baseline_count 判断：
+    全新的地址本来就可能 0 封旧邮件。
+    """
+    key = str(address or "").strip().lower()
+    entry = _read_emailnator_state(emailnator_state_file(address)).get(key)
+    return isinstance(entry, dict) and isinstance(entry.get("baseline"), list)
+
+
+def emailnator_seed_baseline(address: str, message_ids) -> bool:
+    """把一组邮件 id 写成该地址的基线（已有基线时不覆盖）。"""
+    if get_email_provider() != "emailnator" or emailnator_baseline_recorded(address):
+        return False
+    key = str(address or "").strip().lower()
+    path = emailnator_state_file(address)
+    state = _read_emailnator_state(path)
+    entry = state.get(key)
+    if not isinstance(entry, dict):
+        entry = {"codes": []}
+    entry["baseline"] = [str(mid) for mid in (message_ids or ()) if str(mid)]
+    state[key] = entry
+    _write_emailnator_state(path, state)
+    return True
+
+
+def _emailnator_scratch_state_file() -> str:
+    """``new-email`` 用的临时状态文件：地址是 CLI 生成的，事后才知道。"""
+    directory = emailnator_state_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, f"_new-email-{uuid.uuid4().hex}.json")
+
+
+def _emailnator_scratch_baseline(path: str, address: str) -> Optional[List[str]]:
+    """从临时状态文件读回该地址的基线；没有条目返回 None（快照失败）。"""
+    entry = _read_emailnator_state(path).get(str(address).strip().lower())
+    if not isinstance(entry, dict) or not isinstance(entry.get("baseline"), list):
+        return None
+    return [str(mid) for mid in entry["baseline"] if str(mid)]
+
+
+def _emailnator_cmd(subcommand: str, *args, state: Optional[str] = None) -> List[str]:
     script = emailnator_script()
     if not os.path.isfile(script):
         raise Exception(
@@ -390,9 +510,8 @@ def _emailnator_cmd(subcommand: str, *args) -> List[str]:
     proxy = emailnator_proxy()
     if proxy:
         cmd.extend(["--proxy", proxy])
-    state = str(config.get("emailnator_state", "") or "").strip()
     if state:
-        cmd.extend(["--state", os.path.expanduser(state)])
+        cmd.extend(["--state", os.path.expanduser(str(state))])
     return cmd
 
 
@@ -402,17 +521,21 @@ def _emailnator_call(
     timeout: float = 60,
     log_callback: Optional[Callable[[str], None]] = None,
     attempts: int = 1,
+    state: Optional[str] = None,
 ) -> dict:
     """调用 emailnator CLI 并解析其 stdout 上的 JSON 结果。
 
     CLI 的进度日志写在 stderr，stdout 只有一行 JSON；这里把它转给
     log_callback（降级为 [Debug]，避免刷屏），失败时抛出带错误信息的异常。
 
-    ``attempts`` > 1 时重试"传输层"失败（连接被重置、SSL 错误、超时）：
-    代理出口偶发 SSL_ERROR_SYSCALL 属于瞬时故障，重试即可恢复。
+    ``state`` 指定本次调用使用的状态文件（按地址隔离，见
+    ``emailnator_state_file``）；不传时由 CLI 用它自己的默认值。
+
+    ``attempts`` > 1 时重试"传输层"失败（连接被重置、SSL 错误、超时、
+    403）：代理出口偶发 SSL_ERROR_SYSCALL / 403 属于瞬时故障，重试即可恢复。
     业务失败（如"邮箱已存在"）不重试。
     """
-    cmd = _emailnator_cmd(subcommand, *args)
+    cmd = _emailnator_cmd(subcommand, *args, state=state)
     total = max(1, int(attempts))
     last_error: Optional[Exception] = None
     for attempt in range(1, total + 1):
@@ -465,6 +588,12 @@ _TRANSIENT_ERROR_MARKERS = (
     "empty reply from server",
     "bad gateway",
     "service unavailable",
+    # emailnator 后端在并发突发时会回 403（不是业务错误：同一次突发里
+    # 59/60 次调用成功）。CLI 内部已重试 3 次，这里换新进程 = 新会话/TLS
+    # 指纹再试，是有效的恢复手段。
+    "http error 403",
+    "403 forbidden",
+    "forbidden",
 )
 
 
@@ -530,20 +659,52 @@ def emailnator_retry_count() -> int:
 
 
 def emailnator_get_email_and_token() -> tuple:
-    """生成一个临时 Gmail 地址（同时记录旧邮件基线）。
+    """生成一个临时 Gmail 地址，并把它的旧邮件基线落到该地址的状态文件。
 
-    代理出口偶发 SSL 断连，按 ``mail_retry_count`` 重试；每次重试都会新建
-    连接，因此也会换到新的出口 IP。
+    基线由 CLI 的 ``new-email`` 写入我们给的临时状态文件（地址是它生成的，
+    调用前拿不到），成功后再搬到 ``emailnator_state_file(address)`` 供
+    ``wait-code`` 读取。每个注册流程各写各的文件，不会像共享状态文件那样在
+    "读改写"窗口互相覆盖丢基线。
+
+    基线条目缺失说明 CLI 的快照没跑（它吞掉异常只打日志）。这时地址不可信：
+    没有基线的 ``wait-code`` 会把收件箱里已有的营销邮件当新邮件。按传输层
+    失败处理，换一个地址重试。
     """
-    data = _emailnator_call(
-        "new-email",
-        timeout=120,
-        attempts=emailnator_retry_count(),
-    )
-    address = str(data.get("address", "") or "").strip()
-    if not address:
-        raise Exception(f"emailnator 未返回地址: {data}")
-    return address, f"emailnator:{address}"
+    attempts = emailnator_retry_count()
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        scratch = _emailnator_scratch_state_file()
+        try:
+            data = _emailnator_call_once(
+                _emailnator_cmd("new-email", state=scratch),
+                "new-email",
+                timeout=120,
+            )
+            address = str(data.get("address", "") or "").strip()
+            if not address:
+                raise Exception(f"emailnator 未返回地址: {data}")
+            baseline = _emailnator_scratch_baseline(scratch, address)
+            if baseline is None:
+                raise _EmailnatorTransportError(
+                    "基线快照未记录（邮件列表拉取失败），换地址重试"
+                )
+            _write_emailnator_state(
+                emailnator_state_file(address),
+                {address.lower(): {"codes": [], "baseline": baseline}},
+            )
+            return address, f"emailnator:{address}"
+        except _EmailnatorTransportError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            time.sleep(min(20.0, 3.0 * attempt))
+        finally:
+            for leftover in (scratch, scratch[: -len(".json")] + ".tmp"):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
+    raise Exception(f"emailnator new-email 失败: {last_error}")
 
 
 def emailnator_get_messages(address: str) -> list:
@@ -552,9 +713,26 @@ def emailnator_get_messages(address: str) -> list:
         address,
         timeout=90,
         attempts=emailnator_retry_count(),
+        state=emailnator_state_file(address),
     )
     messages = data.get("messages")
     return messages if isinstance(messages, list) else []
+
+
+def emailnator_mail_sender(address: str, message_id: str) -> Optional[str]:
+    """按 message_id 查这封邮件的发件人；查不到返回 None。"""
+    if not message_id:
+        return None
+    try:
+        messages = emailnator_get_messages(address)
+    except Exception:
+        return None
+    for message in messages:
+        if str(message.get("messageID") or message.get("id") or "") != message_id:
+            continue
+        sender = str(message.get("from") or message.get("fromEmail") or "").strip()
+        return sender or None
+    return None
 
 
 def emailnator_get_oai_code(
@@ -571,12 +749,28 @@ def emailnator_get_oai_code(
 ) -> str:
     """轮询 emailnator 收件箱取验证码。
 
-    每次 ``wait-code`` 只等一小段（便于重发和取消），循环到总超时。
-    CLI 的已用码状态文件保证同一地址不会重复返回同一个码；
-    新地址的旧邮件基线由 ``new-email`` 写入，无需 ignore_ids 兜底。
+    每个 ``wait-code`` 只等一小段（便于重发和取消），循环到总超时。
+    CLI 的已用码状态按地址隔离（``--state``），同一地址不会重复返回同一个码。
+
+    只接受 Mozilla 确认邮件里的码：
+    * ``--pattern`` 让 CLI 只从 "Use <6 digits> to confirm your account" /
+      "confirmation code: <6 digits>" 上下文取码，营销邮件不参与提取；
+    * 取到码后再核对发件人，非 Mozilla/Firefox 的邮件直接丢弃并继续等。
     """
-    _ = (dev_token, ignore_ids, code_shape)  # emailnator CLI 自带基线/去重
+    _ = (dev_token, code_shape)
     rejected_codes = set(ignore_codes or ())
+    state_path = emailnator_state_file(email)
+    if not emailnator_baseline_recorded(email):
+        # 外部提供的邮箱（--emails / --signin）没有 new-email 快照：登录流程
+        # 在提交表单前拍的 ignore_ids 就是等价基线，必须补进去。
+        try:
+            emailnator_seed_baseline(
+                email, [str(mid) for mid in (ignore_ids or ()) if str(mid)]
+            )
+        except OSError as exc:
+            if log_callback:
+                log_callback(f"[Debug] emailnator 基线写入失败: {exc}")
+    pattern = emailnator_code_pattern()
     deadline = time.time() + float(timeout)
     next_resend_at = time.time() + 35
     while time.time() < deadline:
@@ -591,18 +785,24 @@ def emailnator_get_oai_code(
             next_resend_at = time.time() + 35
         remaining = deadline - time.time()
         chunk = int(max(5, min(remaining, 60)))
+        wait_args = [
+            email,
+            "--timeout",
+            str(chunk),
+            "--interval",
+            str(max(1, int(poll_interval))),
+        ]
+        if pattern:
+            wait_args.extend(["--pattern", pattern])
         try:
             # wait-code 不在内部重试：每次尝试最多占用 chunk+45s，内层重试会
             # 越过 mail_timeout。外层循环本身就是有界重试（受 deadline 约束）。
             data = _emailnator_call(
                 "wait-code",
-                email,
-                "--timeout",
-                str(chunk),
-                "--interval",
-                str(max(1, int(poll_interval))),
+                *wait_args,
                 timeout=chunk + 45,
                 log_callback=log_callback,
+                state=state_path,
             )
         except Exception as exc:
             if log_callback:
@@ -610,14 +810,29 @@ def emailnator_get_oai_code(
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         code = str(data.get("code", "") or "").strip()
-        if code and code not in rejected_codes:
-            if log_callback:
-                log_callback(f"[*] emailnator 从邮件中提取到验证码: {code}")
-            return code
-        if code:
+        if not code:
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        if code in rejected_codes:
             if log_callback:
                 log_callback(f"[Debug] 跳过已尝试过的验证码: {code}")
             sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        subject = str(data.get("subject", "") or "")
+        sender = emailnator_mail_sender(email, str(data.get("message_id", "") or ""))
+        if sender is not None and not re.search(r"mozilla|firefox", sender, re.IGNORECASE):
+            # 非 Mozilla 邮件里的数字（营销/推广）不能当验证码提交。
+            rejected_codes.add(code)
+            if log_callback:
+                log_callback(
+                    f"[!] 忽略非 Mozilla 邮件的验证码: {code} "
+                    f"from={sender} subject={subject}"
+                )
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        if log_callback:
+            log_callback(f"[*] emailnator 从邮件中提取到验证码: {code}")
+        return code
     raise Exception(f"emailnator 在 {timeout}s 内未收到验证码邮件")
 
 

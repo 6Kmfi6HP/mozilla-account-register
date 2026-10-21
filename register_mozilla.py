@@ -55,6 +55,9 @@ def register_one(
             raise ValueError(f"provider={provider} 需要调用方显式传入 email")
     else:
         credential = None
+        # 外部提供的邮箱没有 new-email 基线：账号创建前先快照，否则 wait-code
+        # 会把收件箱里原有的营销邮件当成新邮件（emailnator 专用）。
+        mail_service.prepare_mail_baseline(email)
 
     if password is None:
         password = _generate_password()
