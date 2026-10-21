@@ -88,6 +88,44 @@ _ENROLL_STATUSES = ("started", "ok", "rate_limited", "failed")
 _UID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 _TOKEN_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
+# 注册请求的"账号已存在/请求过多"页面上会出现的特征文案（FxA 风控提示）。
+# 命中这些文案说明该出口 IP 已被限速，重试同一个 IP 没有意义。
+_RATE_LIMIT_HINTS = (
+    "too many times",
+    "tried too many",
+    "try again in a day",
+    "请稍后再试",
+    "请求过于频繁",
+    "too many requests",
+)
+
+# 账号建好之前 FxA 可能直接报错并弹回首页（服务端没有这个账号）。
+_SIGNUP_ERROR_HINTS = (
+    "unexpected error",
+    "something went wrong",
+    "an error occurred",
+    "we're sorry",
+    "发生错误",
+    "出错了",
+)
+
+
+def _browser_proxy(cfg: dict) -> Optional[str]:
+    """浏览器后端使用的代理地址。
+
+    优先级：``browser_proxy`` > ``proxy`` > ``$BROWSER_PROXY``。
+    FxA 对注册限速是按出口 IP 计的，批量注册必须走代理才能绕开单 IP 配额。
+    """
+    for value in (
+        cfg.get("browser_proxy", ""),
+        cfg.get("proxy", ""),
+        os.environ.get("BROWSER_PROXY", ""),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
 
 class BrowserRegisterError(RuntimeError):
     pass
@@ -99,6 +137,21 @@ class RegisterCancelled(Exception):
 
 class EnrollmentRateLimited(BrowserRegisterError):
     """Guardian 对 /fpn/auth 返回 429（每个账号只尝试一次，不重试）。"""
+
+
+class SignupRateLimited(BrowserRegisterError):
+    """FxA 对注册请求按出口 IP 限速（"tried too many times ... in a day"）。
+
+    账号尚未在服务端创建，重试必须换一个出口 IP（换代理）才有意义。
+    """
+
+
+class SignupNotCreated(BrowserRegisterError):
+    """注册流程在"账号建好之前"失败（页面报错、被弹回首页等）。
+
+    服务端没有这个账号，所以换一个邮箱 + 换一个出口 IP 重试是安全的。
+    典型场景：提交邮箱后页面出现 "Unexpected error" 并退回首页。
+    """
 
 
 def _ensure_cloakbrowser() -> None:
@@ -120,11 +173,32 @@ def _body_snippet(page) -> str:
     return re.sub(r"\s+", " ", text)[:200]
 
 
+def _is_rate_limited(body: str) -> bool:
+    """页面文案是否命中 FxA 的限速提示。"""
+    lowered = (body or "").lower()
+    return any(hint in lowered for hint in _RATE_LIMIT_HINTS)
+
+
+def _is_signup_error_page(body: str) -> bool:
+    """页面是否显示 FxA 的通用错误（账号还没建好就被弹回首页/错误页）。"""
+    lowered = (body or "").lower()
+    return any(hint in lowered for hint in _SIGNUP_ERROR_HINTS)
+
+
 def _fail(page, stage: str, detail: str) -> NoReturn:
-    """统一的失败出口：带 stage、当前 URL 和页面正文片段。"""
-    raise BrowserRegisterError(
-        f"[stage={stage}] {detail}; url={page.url}; body={_body_snippet(page)}"
-    )
+    """统一的失败出口：带 stage、当前 URL 和页面正文片段。
+
+    - 命中限速文案 → ``SignupRateLimited``（换出口 IP 重试）
+    - 命中通用错误页 → ``SignupNotCreated``（账号没建好，换邮箱重试）
+    - 其他 → ``BrowserRegisterError``，原样上报
+    """
+    body = _body_snippet(page)
+    message = f"[stage={stage}] {detail}; url={page.url}; body={body}"
+    if _is_rate_limited(body):
+        raise SignupRateLimited(message)
+    if _is_signup_error_page(body):
+        raise SignupNotCreated(message)
+    raise BrowserRegisterError(message)
 
 
 # ---------------------------------------------------------------- signup helpers
@@ -741,9 +815,9 @@ def register_one_browser(
     ``register_one_browser(email=..., password=..., config=..., log_callback=...)``
     调用。email/password 必须由调用方显式传入。
 
-    ``on_account_created(email, password)`` 在点击 "Create account" 成功后立即
-    调用（此时账号已在服务端创建）：调用方应立刻持久化凭据，避免后续验证码
-    或收尾失败导致账号丢失。
+    ``on_account_created(email, password)`` 在**到达验证码输入页**后才调用：
+    只有到达该页才说明账号已在服务端创建（被限速或校验失败时页面会退回密码页，
+    账号并不存在）。调用方应立刻持久化凭据，避免后续收码或收尾失败导致账号丢失。
 
     返回值在原有 ``email/password/verified/password_set`` 之外新增
     ``uid/session_token/enrolled/entitlement/enrollment_skipped/bundle_path/
@@ -760,9 +834,10 @@ def register_one_browser(
     browser = None
     page = None
     try:
-        log("[*] 启动反检测浏览器 (cloakbrowser)")
+        proxy = _browser_proxy(cfg)
+        log(f"[*] 启动反检测浏览器 (cloakbrowser) 代理={proxy or '直连'}")
         try:
-            browser = cloakbrowser.launch(headless=True, humanize=True)
+            browser = cloakbrowser.launch(headless=True, humanize=True, proxy=proxy)
             page = browser.new_page()
         except Exception as exc:
             raise BrowserRegisterError(f"浏览器启动失败: {exc}") from exc
@@ -853,15 +928,7 @@ def register_one_browser(
                 raise
             except Exception as exc:
                 _fail(page, "password", f"could not click Create account: {exc}")
-        # 点击 "Create account" 即创建账号并发送 6 位验证码邮件。
-        log("[*] 已提交密码，账号已创建，等待验证码输入页")
-        if on_account_created is not None:
-            # 账号已在服务端创建：立刻让调用方持久化 email/password。
-            # 回调失败不能中断注册（账号已经存在），但必须大声记录。
-            try:
-                on_account_created(email, password)
-            except Exception as exc:
-                log(f"[!] on_account_created 回调失败: {exc}")
+        log("[*] 已提交密码，等待验证码输入页")
 
         try:
             page.wait_for_selector(_SEL_CODE, timeout=SELECTOR_TIMEOUT_MS)
@@ -869,6 +936,16 @@ def register_one_browser(
             raise
         except Exception:
             _fail(page, "code", "signup did not reach the verification code screen")
+
+        # 到达验证码页才说明账号在服务端真的建好了（限速/校验失败时页面会退回
+        # 密码页，账号并不存在）。此时立刻让调用方持久化 email/password。
+        log("[*] 账号已创建，等待验证码")
+        if on_account_created is not None:
+            # 回调失败不能中断注册（账号已经存在），但必须大声记录。
+            try:
+                on_account_created(email, password)
+            except Exception as exc:
+                log(f"[!] on_account_created 回调失败: {exc}")
 
         cancel()
         ignore_ids: set = set()
@@ -995,9 +1072,10 @@ def ensure_session_browser(
     browser = None
     page = None
     try:
-        log("[*] 启动反检测浏览器 (cloakbrowser)")
+        proxy = _browser_proxy(cfg)
+        log(f"[*] 启动反检测浏览器 (cloakbrowser) 代理={proxy or '直连'}")
         try:
-            browser = cloakbrowser.launch(headless=True, humanize=True)
+            browser = cloakbrowser.launch(headless=True, humanize=True, proxy=proxy)
             page = browser.new_page()
         except Exception as exc:
             raise BrowserRegisterError(f"浏览器启动失败: {exc}") from exc

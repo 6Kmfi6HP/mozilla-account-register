@@ -1,4 +1,8 @@
 config.json
+# 本地私有配置（含真实代理地址 / 邮箱服务凭据），不提交
+config.*.json
+!config.example.json
+emails*.txt
 mail_credentials.txt
 accounts_*.txt
 *.pending.jsonl

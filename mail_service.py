@@ -2,15 +2,23 @@
 
 聚焦 cloudmail（HTTP API）与验证码正则提取；HTTP 客户端抽象成可替换
 （requests / curl_cffi），避免对本机不存在的依赖强绑定。
+
+另外支持 emailnator（临时 Gmail）作为 provider：通过子进程调用
+``~/.claude/skills/emailnator/emailnator.py``，复用它的代理、TLS 指纹、
+基线快照（新地址生成时刻的旧邮件一律忽略）和"已用验证码"状态。
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import secrets
 import string
+import subprocess
+import sys
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 import requests
 
@@ -327,6 +335,12 @@ def snapshot_mail_ids(email: str) -> set:
     注册/登录留下的验证码当成新码提交。
     """
     provider = get_email_provider()
+    if provider == "emailnator":
+        try:
+            messages = emailnator_get_messages(email)
+        except Exception:
+            return set()
+        return {str(msg.get("messageID") or msg.get("id")) for msg in messages if msg.get("messageID") or msg.get("id")}
     if provider != "cloudmail":
         return set()
     try:
@@ -343,6 +357,270 @@ def snapshot_mail_ids(email: str) -> set:
     return ids
 
 
+# ---------------------------------------------------------------- emailnator
+
+DEFAULT_EMAILNATOR_SCRIPT = "~/.claude/skills/emailnator/emailnator.py"
+
+
+def emailnator_script() -> str:
+    raw = str(config.get("emailnator_script", "") or "").strip() or DEFAULT_EMAILNATOR_SCRIPT
+    return os.path.expanduser(raw)
+
+
+def emailnator_proxy() -> str:
+    """emailnator 后端强制走代理：emailnator_proxy > proxy > $EMAILNATOR_PROXY。"""
+    for value in (
+        config.get("emailnator_proxy", ""),
+        config.get("proxy", ""),
+        os.environ.get("EMAILNATOR_PROXY", ""),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _emailnator_cmd(subcommand: str, *args) -> List[str]:
+    script = emailnator_script()
+    if not os.path.isfile(script):
+        raise Exception(
+            f"emailnator 脚本不存在: {script}（用配置项 emailnator_script 指定路径）"
+        )
+    cmd = [sys.executable, script, subcommand, *args]
+    proxy = emailnator_proxy()
+    if proxy:
+        cmd.extend(["--proxy", proxy])
+    state = str(config.get("emailnator_state", "") or "").strip()
+    if state:
+        cmd.extend(["--state", os.path.expanduser(state)])
+    return cmd
+
+
+def _emailnator_call(
+    subcommand: str,
+    *args,
+    timeout: float = 60,
+    log_callback: Optional[Callable[[str], None]] = None,
+    attempts: int = 1,
+) -> dict:
+    """调用 emailnator CLI 并解析其 stdout 上的 JSON 结果。
+
+    CLI 的进度日志写在 stderr，stdout 只有一行 JSON；这里把它转给
+    log_callback（降级为 [Debug]，避免刷屏），失败时抛出带错误信息的异常。
+
+    ``attempts`` > 1 时重试"传输层"失败（连接被重置、SSL 错误、超时）：
+    代理出口偶发 SSL_ERROR_SYSCALL 属于瞬时故障，重试即可恢复。
+    业务失败（如"邮箱已存在"）不重试。
+    """
+    cmd = _emailnator_cmd(subcommand, *args)
+    total = max(1, int(attempts))
+    last_error: Optional[Exception] = None
+    for attempt in range(1, total + 1):
+        try:
+            return _emailnator_call_once(
+                cmd,
+                subcommand,
+                timeout=timeout,
+                log_callback=log_callback,
+            )
+        except _EmailnatorTransportError as exc:
+            last_error = exc
+            if attempt >= total:
+                break
+            delay = min(20.0, 3.0 * attempt)
+            if log_callback:
+                log_callback(
+                    f"[Debug] emailnator {subcommand} 传输失败({exc})，"
+                    f"{delay:.0f}s 后重试 ({attempt}/{total})"
+                )
+            time.sleep(delay)
+    raise Exception(f"emailnator {subcommand} 失败: {last_error}")
+
+
+class _EmailnatorTransportError(Exception):
+    """emailnator CLI 的传输层失败（连接/SSL/超时），可以重试。"""
+
+
+# emailnator CLI 把所有异常都包成 {"ok": false, "error": "..."}，
+# 所以传输层错误必须按错误文本分类。
+_TRANSIENT_ERROR_MARKERS = (
+    "sslerror",
+    "sslfailure",
+    "ssl_connect",
+    "ssl_error",
+    "connectionerror",
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "connection aborted",
+    "remotedisconnected",
+    "curl: (28)",
+    "curl: (35)",
+    "curl: (56)",
+    "curl: (7)",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "network is unreachable",
+    "empty reply from server",
+    "bad gateway",
+    "service unavailable",
+)
+
+
+def _is_transient_emailnator_error(text: str) -> bool:
+    """错误文本是否属于可重试的传输层故障。"""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _emailnator_call_once(
+    cmd: List[str],
+    subcommand: str,
+    *,
+    timeout: float,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """执行一次 emailnator CLI 调用并解析结果。"""
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(5.0, float(timeout)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _EmailnatorTransportError(f"超时 ({timeout}s)") from exc
+    except Exception as exc:
+        raise _EmailnatorTransportError(f"执行失败: {exc}") from exc
+
+    if log_callback:
+        for line in (completed.stderr or "").splitlines():
+            if line.strip():
+                log_callback(f"[Debug] {line.strip()}")
+    data = None
+    for line in reversed((completed.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                break
+    if not isinstance(data, dict):
+        raise _EmailnatorTransportError(
+            f"返回非 JSON: {(completed.stdout or completed.stderr or '')[:300]}"
+        )
+    if not data.get("ok"):
+        error = str(data.get("error", "") or "")
+        if _is_transient_emailnator_error(error):
+            raise _EmailnatorTransportError(error)
+        raise Exception(f"emailnator {subcommand} 失败: {error}")
+    return data
+
+
+def emailnator_retry_count() -> int:
+    """emailnator CLI 传输失败时的重试次数（``mail_retry_count``，默认 3）。"""
+    try:
+        value = int(config.get("mail_retry_count", 3) or 3)
+    except (TypeError, ValueError):
+        return 3
+    return max(1, min(10, value))
+
+
+def emailnator_get_email_and_token() -> tuple:
+    """生成一个临时 Gmail 地址（同时记录旧邮件基线）。
+
+    代理出口偶发 SSL 断连，按 ``mail_retry_count`` 重试；每次重试都会新建
+    连接，因此也会换到新的出口 IP。
+    """
+    data = _emailnator_call(
+        "new-email",
+        timeout=120,
+        attempts=emailnator_retry_count(),
+    )
+    address = str(data.get("address", "") or "").strip()
+    if not address:
+        raise Exception(f"emailnator 未返回地址: {data}")
+    return address, f"emailnator:{address}"
+
+
+def emailnator_get_messages(address: str) -> list:
+    data = _emailnator_call(
+        "messages",
+        address,
+        timeout=90,
+        attempts=emailnator_retry_count(),
+    )
+    messages = data.get("messages")
+    return messages if isinstance(messages, list) else []
+
+
+def emailnator_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+    ignore_ids=None,
+    ignore_codes=None,
+    code_shape=None,
+) -> str:
+    """轮询 emailnator 收件箱取验证码。
+
+    每次 ``wait-code`` 只等一小段（便于重发和取消），循环到总超时。
+    CLI 的已用码状态文件保证同一地址不会重复返回同一个码；
+    新地址的旧邮件基线由 ``new-email`` 写入，无需 ignore_ids 兜底。
+    """
+    _ = (dev_token, ignore_ids, code_shape)  # emailnator CLI 自带基线/去重
+    rejected_codes = set(ignore_codes or ())
+    deadline = time.time() + float(timeout)
+    next_resend_at = time.time() + 35
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                if resend_callback() and log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            next_resend_at = time.time() + 35
+        remaining = deadline - time.time()
+        chunk = int(max(5, min(remaining, 60)))
+        try:
+            # wait-code 不在内部重试：每次尝试最多占用 chunk+45s，内层重试会
+            # 越过 mail_timeout。外层循环本身就是有界重试（受 deadline 约束）。
+            data = _emailnator_call(
+                "wait-code",
+                email,
+                "--timeout",
+                str(chunk),
+                "--interval",
+                str(max(1, int(poll_interval))),
+                timeout=chunk + 45,
+                log_callback=log_callback,
+            )
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] emailnator wait-code 失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        code = str(data.get("code", "") or "").strip()
+        if code and code not in rejected_codes:
+            if log_callback:
+                log_callback(f"[*] emailnator 从邮件中提取到验证码: {code}")
+            return code
+        if code:
+            if log_callback:
+                log_callback(f"[Debug] 跳过已尝试过的验证码: {code}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"emailnator 在 {timeout}s 内未收到验证码邮件")
+
+
 # ---------------------------------------------------------------- dispatch
 
 def get_email_provider() -> str:
@@ -354,6 +632,8 @@ def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider == "cloudmail":
         return cloudmail_get_email_and_token()
+    if provider == "emailnator":
+        return emailnator_get_email_and_token()
     if provider == "manual":
         # 手动模式：调用方负责提供邮箱，credential 占位。
         raise Exception("manual provider 需要由调用方直接传入邮箱，不应调用 get_email_and_token")
@@ -375,6 +655,19 @@ def get_oai_code(
     provider = get_email_provider()
     if provider == "cloudmail":
         return cloudmail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+            ignore_ids=ignore_ids,
+            ignore_codes=ignore_codes,
+            code_shape=code_shape,
+        )
+    if provider == "emailnator":
+        return emailnator_get_oai_code(
             dev_token,
             email,
             timeout=timeout,

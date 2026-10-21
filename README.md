@@ -4,8 +4,8 @@
 
 提供**两个注册后端**：
 
-- **API 后端（默认）**：纯 HTTP onepw 协议。客户端派生 `authPW` → `POST /account/create` → 从临时邮箱自动取验证码 → `POST /recovery_email/verify_code` 完成验证。
-- **浏览器后端（`--backend browser`）**：cloakbrowser 反检测浏览器走真实注册页。生产环境 Auth Server 对 POST 有 Fastly WAF（`Client Challenge`），纯 HTTP 创建账号可能被 406 拦截，此后端可稳定绕过；它还能从 `localStorage` 采集 FxA 会话，可选完成一次性开通，并把凭据桥接给 [fxpool-proxy](https://github.com/6Kmfi6HP/firefox-ip-protection-pool-go)，**让续期凭据的获取完全脱离 Firefox 浏览器**。
+- **API 后端（默认）**：纯 HTTP onepw 协议。客户端派生 `authPW` → `POST /account/create` → 从临时邮箱自动取验证码 → `POST /recovery_email/verify_code` 完成验证，并可为每个验证成功账号写出 fxpool 凭据包。
+- **浏览器后端（`--backend browser`）**：cloakbrowser 走真实注册页，绕过生产 WAF；它还能从 `localStorage` 采集 FxA 会话。两个后端都可把验证后的会话桥接给 [fxpool-proxy](https://github.com/6Kmfi6HP/firefox-ip-protection-pool-go)，浏览器后端还可选完成一次性开通。
 
 ## 特性
 
@@ -39,19 +39,25 @@ python register.py --count 3
 # 5. 从文件批量注册
 python register.py --emails emails.txt --threads 2
 
-# 6. 浏览器后端（绕过生产 WAF；需先装 cloakbrowser）
+# 6. API 后端批量注册并为每个账号写入 fxpool 凭据包
+python register.py --emails emails.txt --threads 2 --bundle-dir fxpool-bundles
+
+# 7. 浏览器后端（绕过生产 WAF；需先装 cloakbrowser）
 pip install cloakbrowser
 python register.py --backend browser --count 1
 
-# 7. 浏览器后端 + 开通 + 为 fxpool-proxy 写凭据包
+# 8. 浏览器后端 + 开通 + 为 fxpool-proxy 写凭据包
 python register.py --backend browser --count 1 --enroll --bundle-dir fxpool-bundles
 
-# 8. 注册机与代理同机：直接写 <root>/tokens/renewal_credentials.json
+# 9. 注册机与代理同机：直接写 <root>/tokens/renewal_credentials.json
 python register.py --backend browser --count 1 --enroll --fxpool-root ~/.fxpool
 
-# 9. 已有账号：只登录生成会话/凭据，不创建新账号
+# 10. 已有账号：只登录生成会话/凭据，不创建新账号
 python register.py --backend browser --signin --emails accounts_20261021_120000.txt \
   --enroll --fxpool-root ~/.fxpool
+
+# 11. 用 emailnator 临时 Gmail 收码（config.json 里 email_provider=emailnator）
+python register.py --backend browser --count 3
 ```
 
 ## 配置
@@ -60,26 +66,33 @@ python register.py --backend browser --signin --emails accounts_20261021_120000.
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `email_provider` | 是 | `cloudmail`（当前默认且唯一随仓库提供的实现） |
-| `cloudmail_api_base` | 是 | Cloud Mail 服务地址 |
-| `cloudmail_public_token` | 是 | Cloud Mail 公共 Token |
+| `email_provider` | 是 | `cloudmail`（默认）或 `emailnator`（临时 Gmail） |
+| `cloudmail_api_base` | 是 | Cloud Mail 服务地址（`cloudmail` 时必填） |
+| `cloudmail_public_token` | 是 | Cloud Mail 公共 Token（`cloudmail` 时必填） |
 | `cloudmail_domains` | 是 | 收件域名，逗号分隔（随机轮换生成邮箱） |
 | `cloudmail_path_messages` | 否 | 邮件列表接口路径，默认 `/api/public/emailList` |
+| `emailnator_script` | 否 | emailnator CLI 路径，默认 `~/.claude/skills/emailnator/emailnator.py` |
+| `emailnator_proxy` | 否 | emailnator 专用代理（优先级高于 `proxy` / `$EMAILNATOR_PROXY`；该后端强制走代理） |
+| `emailnator_state` | 否 | emailnator 已用验证码状态文件，默认由 CLI 决定（`~/.emailnator/used_codes.json`） |
 | `auth_base` | 否 | Mozilla Auth Server，默认 `https://api.accounts.firefox.com/v1` |
 | `proxy` | 否 | HTTP 代理（批量高频时建议用代理池） |
+| `browser_proxy` | 否 | 浏览器后端专用代理（优先级：`browser_proxy` > `proxy` > `$BROWSER_PROXY`）。**批量注册必填**——FxA 按出口 IP 限速 |
 | `register_backend` | 否 | `api`（默认）或 `browser` |
 | `register_count` | 否 | 自动生成邮箱时注册数量 |
 | `register_threads` | 否 | 并发线程数 |
+| `register_max_attempts` | 否 | 单个账号被限速时的最大重试次数（每次重试换邮箱 + 换出口 IP），默认 10 |
 | `mail_timeout` | 否 | 等待验证码超时（秒） |
 | `mail_poll_interval` | 否 | 邮箱轮询间隔（秒） |
+| `mail_retry_count` | 否 | emailnator CLI 传输层失败（SSL 断连/超时）的重试次数，默认 3 |
+| `account_hard_timeout` | 否 | 单个账号的总时长上限（秒），默认 900；限速重试受它约束 |
 | `emails_file` | 否 | 邮箱列表文件路径（也支持 `--emails` CLI 参数） |
-| `fxpool_enroll` | 否 | 注册/登录后执行一次性开通（等价 `--enroll`） |
-| `fxpool_root` | 否 | 写入 `<PATH>/tokens/renewal_credentials.json`（等价 `--fxpool-root`；也可用环境变量 `FXPOOL_ROOT`） |
-| `bundle_dir` | 否 | 为每个账号写 `<DIR>/<uid>.json` 凭据包（等价 `--bundle-dir`，空=关闭） |
+| `fxpool_enroll` | 否 | 注册/登录后执行一次性开通（仅浏览器后端；等价 `--enroll`） |
+| `fxpool_root` | 否 | 写入 `<PATH>/tokens/renewal_credentials.json`（仅浏览器后端；等价 `--fxpool-root`；也可用环境变量 `FXPOOL_ROOT`） |
+| `bundle_dir` | 否 | 为每个验证成功的账号写 `<DIR>/<uid>.json` 凭据包（API 和浏览器后端；等价 `--bundle-dir`，空=关闭） |
 
-`fxpool_enroll` / `fxpool_root` / `bundle_dir` 只在浏览器后端生效。配置里误留
-`fxpool_root` 不会影响 API 后端；但 `fxpool_enroll=true` 与 `register_backend=api`
-同时出现会直接报配置错误。
+`fxpool_enroll` / `fxpool_root` 只在浏览器后端生效。`bundle_dir` 在两个后端都生效；
+`--no-bridge` 可在任一后端关闭凭据发布。API 后端会忽略 `fxpool_root`，但
+`fxpool_enroll=true` 与 `register_backend=api` 同时出现会直接报配置错误。
 
 ## 命令行
 
@@ -100,8 +113,8 @@ python register.py [选项]
 ```
 
 > 提示：若生产 API 被 WAF 拦截（HTTP 406），请改用 `--backend browser`。
-> `--enroll`、`--fxpool-root`、`--bundle-dir`、`--no-bridge`、`--signin`
-> 只能与 `--backend browser` 一起使用。
+`--enroll`、`--fxpool-root`、`--signin` 只能与 `--backend browser` 一起使用；
+`--bundle-dir` 与 `--no-bridge` 两个后端都支持。
 
 ### 登录已有账号（`--signin`）
 
@@ -120,7 +133,7 @@ python register.py [选项]
     流程成功返回后原地更新为 `browser-verified`；
   - API 后端 extra 为账号 uid。
 - **邮箱凭证**：`mail_credentials.txt`，格式 `邮箱\t凭证`（可回读）。
-- **凭据包**（可选）：`<bundle_dir>/<uid>.json`，键恰好为
+- **凭据包**（可选，API/浏览器后端）：`<bundle_dir>/<uid>.json`，键恰好为
   `schema/email/uid/session_token`，权限 0600。
 - **fxpool 凭据**（可选）：`<fxpool_root>/tokens/renewal_credentials.json`，
   紧凑 JSON、`schema` 为数字 1、权限 0600，目录 0700。
@@ -199,11 +212,41 @@ mozilla-account-register/
 > `force=True`。登录路径会先快照邮箱中的旧邮件，避免把上一次注册的验证码
 > 当成新的登录码提交。
 
+### 出口 IP 限速（批量注册必读）
+
+FxA 对注册接口按**出口 IP** 限速：同一 IP 反复注册会看到
+`You've tried too many times. Please try again in a day.`。
+这不是账号问题，换 IP 就能继续。
+
+处理方式：
+
+- `browser_proxy`（或 `proxy` / `$BROWSER_PROXY`）给浏览器指定代理。
+  SOCKS5 代理每条新连接换一个出口 IP，所以**每次重试都会自动换 IP**。
+- 命中限速文案时抛 `SignupRateLimited`；注册页出现 `Unexpected error` 被弹回
+  首页时抛 `SignupNotCreated`。两者都发生在"账号在服务端建好"之前，
+  `register.py` 捕获后**换一个临时邮箱**重试（服务端没有为上一个邮箱建号），
+  最多 `register_max_attempts` 次，且总时长受 `account_hard_timeout` 约束。
+- 账号只有在落到 `/settings`（验证码通过）后才会被标成 `browser-verified`。
+  限速/校验失败发生在到达验证码页之前，账号不存在，也不会写进结果文件。
+- emailnator CLI 偶发 `curl: (35) SSL_ERROR_SYSCALL`（代理出口抖动），
+  这类传输层失败会按 `mail_retry_count` 自动重试；业务失败（如邮箱已存在）不重试。
+
+> 直连（不走代理）时，同一出口 IP 连续注册第 2 个账号起就会被限速，
+> 10 个账号全部失败。走代理后 10/10 成功。
+
 ### 与 fxpool-proxy 对接
 
 - 注册机生成凭据包后，在代理机执行：
   `fxpool-proxy import-credentials <uid>.json --delete-source`
   （也支持从 stdin 读取：`fxpool-proxy import-credentials - --no-verify`）
+- 批量导入整个凭据包目录用 `import_bundles.py`：
+  ```bash
+  python import_bundles.py --bundle-dir fxpool-bundles \
+      --fxpool-root /path/to/fxpool-root
+  ```
+  默认离线导入（传 `--no-verify`），并给 `fxpool-proxy` 传 `--delete-source`
+  让它在导入成功后删掉凭据包；`--keep` 不传该参数、`--verify` 联网校验、
+  `--dry-run` 只列清单。导入失败时凭据包保留以便重试。
 - 同机运行时直接用 `--fxpool-root <fxpool 运行目录>`，fxpool-proxy 的
   `token-status` / `token-refresh --force` / `usage` / `run` 会读取
   `<root>/tokens/renewal_credentials.json`。
@@ -222,6 +265,9 @@ python -m unittest discover -s tests -q
 - 凭据包的键顺序、字节格式、0600/0700 权限、同 uid 覆盖与不同 uid 拒绝
 - `select_account_entry` 的 uid/email/currentAccountUid/lastLogin 选择规则
 - `accounts_*.txt` 解析与开通台账的一次性语义
+- 限速文案识别（`SignupRateLimited`）与"限速换邮箱重试"的次数/边界
+- 浏览器代理优先级（`browser_proxy` > `proxy` > `$BROWSER_PROXY`）与透传给 `launch()`
+- emailnator 传输层失败重试、业务失败不重试
 - 配置加载与校验、路径与输出格式
 
 ## 免责声明

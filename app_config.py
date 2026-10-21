@@ -16,8 +16,14 @@ DEFAULT_CONFIG = {
     "cloudmail_public_token": "",
     "cloudmail_domains": "",
     "cloudmail_path_messages": "/api/public/emailList",
+    # 邮箱服务（emailnator 临时 Gmail）
+    "emailnator_script": "~/.claude/skills/emailnator/emailnator.py",
+    "emailnator_proxy": "",
+    "emailnator_state": "",
     # 网络
     "proxy": "",
+    # 浏览器后端专用代理（FxA 对注册按出口 IP 限速，批量注册必须走代理）
+    "browser_proxy": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # 注册参数
     "service": "sync",
@@ -122,7 +128,7 @@ def validate_config(cfg=None):
     _require_int(data, "mail_poll_interval", 1, 60)
     _require_int(data, "register_max_attempts", 1, 1000)
     provider = str(data.get("email_provider", "cloudmail") or "cloudmail").strip().lower()
-    if provider not in ("cloudmail", "duckmail", "yyds", "cloudflare", "manual"):
+    if provider not in ("cloudmail", "emailnator", "duckmail", "yyds", "cloudflare", "manual"):
         raise ConfigError(f"不支持的 email_provider: {provider}")
     # 新增键只在出现时做类型校验，兼容直接传 dict 的调用方
     if "register_backend" in data:

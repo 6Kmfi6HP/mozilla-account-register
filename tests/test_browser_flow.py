@@ -240,7 +240,7 @@ class TestCliGuard(unittest.TestCase):
     def tearDown(self):
         app_config.config = app_config.DEFAULT_CONFIG.copy()
 
-    def _run(self, config_data, *extra):
+    def _run(self, config_data, *extra, capture_output=False):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
             with open(path, "w", encoding="utf-8") as handle:
@@ -248,11 +248,22 @@ class TestCliGuard(unittest.TestCase):
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = register.main(["--config", path, "--dry-run", *extra])
+            if capture_output:
+                return code, out.getvalue(), err.getvalue()
             return code, err.getvalue()
 
     def test_config_fxpool_root_is_inert_on_api_backend(self):
         code, _ = self._run({"fxpool_root": "/tmp/pool"})
         self.assertEqual(code, 0)
+
+    def test_api_config_warning_mentions_only_fxpool_root(self):
+        code, out, _ = self._run(
+            {"fxpool_root": "/tmp/pool", "bundle_dir": "/tmp/bundles"},
+            capture_output=True,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("fxpool_root", out)
+        self.assertNotIn("bundle_dir", out)
 
     def test_explicit_fxpool_root_requires_browser_backend(self):
         code, err = self._run({}, "--fxpool-root", "/tmp/pool")
@@ -263,6 +274,25 @@ class TestCliGuard(unittest.TestCase):
         code, err = self._run({"fxpool_enroll": True})
         self.assertEqual(code, 2)
         self.assertIn("fxpool_enroll", err)
+    def test_api_accepts_bundle_dir(self):
+        code, err = self._run({}, "--bundle-dir", "/tmp/bundles")
+        self.assertEqual(code, 0)
+        self.assertNotIn("需要 --backend browser", err)
+
+    def test_api_accepts_no_bridge(self):
+        code, err = self._run({}, "--no-bridge")
+        self.assertEqual(code, 0)
+        self.assertNotIn("需要 --backend browser", err)
+
+    def test_explicit_enroll_requires_browser_backend(self):
+        code, err = self._run({}, "--enroll")
+        self.assertEqual(code, 2)
+        self.assertIn("--backend browser", err)
+
+    def test_explicit_signin_requires_browser_backend(self):
+        code, err = self._run({}, "--signin")
+        self.assertEqual(code, 2)
+        self.assertIn("--backend browser", err)
 
 
 class _FakeResponse:
@@ -472,6 +502,261 @@ class TestExtractCodeShapes(unittest.TestCase):
 
     def test_alnum8_rejects_numeric_dates(self):
         self.assertIsNone(mail_service.extract_code("sent 2026-1020", "", "alnum8"))
+
+
+class TestRateLimitDetection(unittest.TestCase):
+    """FxA 限速文案必须能区分出来，才能换 IP 重试。"""
+
+    def test_rate_limited_body_detected(self):
+        body = (
+            "Opens in new window Create a password You’ve tried too many times. "
+            "Please try again ⁨in a day⁩."
+        )
+        self.assertTrue(register_browser._is_rate_limited(body))
+
+    def test_normal_body_not_rate_limited(self):
+        self.assertFalse(register_browser._is_rate_limited("Create a password"))
+
+    def test_fail_raises_rate_limited(self):
+        page = mock.Mock()
+        page.url = "https://accounts.firefox.com/signup"
+        page.inner_text.return_value = (
+            "You've tried too many times. Please try again in a day."
+        )
+        with self.assertRaises(register_browser.SignupRateLimited):
+            register_browser._fail(page, "code", "boom")
+
+    def test_fail_raises_plain_error(self):
+        page = mock.Mock()
+        page.url = "https://accounts.firefox.com/signup"
+        page.inner_text.return_value = "Enter a valid password"
+        with self.assertRaises(register_browser.BrowserRegisterError) as ctx:
+            register_browser._fail(page, "password", "boom")
+        self.assertNotIsInstance(ctx.exception, register_browser.SignupRateLimited)
+
+    def test_unexpected_error_page_detected(self):
+        body = (
+            "Opens in new window Enter your email Continue to account settings "
+            "Unexpected error Enter your email Sign up or sign in"
+        )
+        self.assertTrue(register_browser._is_signup_error_page(body))
+
+    def test_normal_page_not_signup_error(self):
+        self.assertFalse(
+            register_browser._is_signup_error_page("Create a password")
+        )
+
+    def test_fail_raises_signup_not_created(self):
+        page = mock.Mock()
+        page.url = "https://accounts.firefox.com/"
+        page.inner_text.return_value = "Unexpected error Enter your email"
+        with self.assertRaises(register_browser.SignupNotCreated):
+            register_browser._fail(page, "password", "no password field")
+
+
+class TestBrowserProxy(unittest.TestCase):
+    """浏览器必须走代理，否则批量注册会被 FxA 按出口 IP 限速。"""
+
+    def test_browser_proxy_precedence(self):
+        cfg = {"browser_proxy": "socks5://a:1", "proxy": "http://b:2"}
+        self.assertEqual(register_browser._browser_proxy(cfg), "socks5://a:1")
+
+    def test_falls_back_to_proxy(self):
+        cfg = {"proxy": "http://b:2"}
+        self.assertEqual(register_browser._browser_proxy(cfg), "http://b:2")
+
+    def test_env_fallback(self):
+        with mock.patch.dict(os.environ, {"BROWSER_PROXY": "socks5://c:3"}):
+            self.assertEqual(register_browser._browser_proxy({}), "socks5://c:3")
+
+    def test_none_when_unset(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(register_browser._browser_proxy({}))
+
+    def test_launch_forwards_proxy(self):
+        """launch() 必须收到 proxy 参数，否则这个改动等于没做。"""
+        browser = mock.Mock()
+        page = mock.Mock()
+        browser.new_page.return_value = page
+        with mock.patch.object(register_browser, "cloakbrowser") as cloaked:
+            cloaked.launch.return_value = browser
+            page.goto.side_effect = register_browser.RegisterCancelled()
+            with self.assertRaises(register_browser.RegisterCancelled):
+                register_browser.register_one_browser(
+                    email="user@example.org",
+                    password="x" * 12,
+                    config={"browser_proxy": "socks5://a:1"},
+                    cancel_callback=lambda: None,
+                )
+        cloaked.launch.assert_called_once()
+        self.assertEqual(cloaked.launch.call_args.kwargs.get("proxy"), "socks5://a:1")
+
+
+class TestEmailnatorRetry(unittest.TestCase):
+    """代理出口偶发 SSL 断连，传输层失败必须重试；业务失败不重试。"""
+
+    def test_transient_error_classified(self):
+        self.assertTrue(
+            mail_service._is_transient_emailnator_error(
+                "SSLError: Failed to perform, curl: (35) BoringSSL SSL_connect: "
+                "Connection closed abruptly"
+            )
+        )
+        self.assertTrue(
+            mail_service._is_transient_emailnator_error("ConnectionError: reset by peer")
+        )
+        self.assertTrue(
+            mail_service._is_transient_emailnator_error("curl: (28) Operation timed out")
+        )
+
+    def test_business_error_not_transient(self):
+        self.assertFalse(mail_service._is_transient_emailnator_error("CliError: 邮箱已存在"))
+
+    def test_call_retries_then_succeeds(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if len(calls) < 3:
+                return mock.Mock(
+                    stdout=json.dumps(
+                        {
+                            "ok": False,
+                            "error": "SSLError: curl: (35) Connection closed abruptly",
+                        }
+                    ),
+                    stderr="",
+                )
+            return mock.Mock(
+                stdout=json.dumps({"ok": True, "address": "a@b.com"}), stderr=""
+            )
+
+        with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(mail_service.time, "sleep"):
+                data = mail_service._emailnator_call("new-email", attempts=3)
+        self.assertEqual(data["address"], "a@b.com")
+        self.assertEqual(len(calls), 3)
+
+    def test_call_gives_up_after_attempts(self):
+        def fake_run(cmd, **kwargs):
+            return mock.Mock(
+                stdout=json.dumps(
+                    {"ok": False, "error": "SSLError: curl: (35) Connection closed"}
+                ),
+                stderr="",
+            )
+
+        with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(mail_service.time, "sleep"):
+                with self.assertRaises(Exception) as ctx:
+                    mail_service._emailnator_call("new-email", attempts=2)
+        self.assertIn("SSLError", str(ctx.exception))
+
+    def test_business_error_not_retried(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(
+                stdout=json.dumps({"ok": False, "error": "CliError: 邮箱已存在"}),
+                stderr="",
+            )
+
+        with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(Exception) as ctx:
+                mail_service._emailnator_call("new-email", attempts=3)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("邮箱已存在", str(ctx.exception))
+
+
+class TestRateLimitedRetry(unittest.TestCase):
+    """限速时必须换邮箱重试，且不能把失败尝试当成成功。"""
+
+    def setUp(self):
+        self.calls = []
+
+    def _patch(self, results):
+        def fake_attempt(email, config, log, account_path, mail_credential_dir, options):
+            self.calls.append(email)
+            outcome = results.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome, {"email": None, "password": None}
+
+        return mock.patch.object(
+            register, "_register_one_browser_attempt", fake_attempt
+        )
+
+    def test_retries_with_fresh_email(self):
+        results = [
+            register_browser.SignupRateLimited("rate limited"),
+            ({"email": "u@example.org", "password": "p"}, {}),
+        ]
+        with self._patch(results):
+            out = register._run_one(
+                "first@example.org",
+                {"register_max_attempts": 5},
+                lambda m: None,
+                "",
+                "",
+                auth_client=None,
+                backend="browser",
+            )
+        self.assertEqual(out[0]["email"], "u@example.org")
+        # 第二次必须换邮箱（服务端并没有为第一个邮箱建号）。
+        self.assertEqual(self.calls, ["first@example.org", None])
+
+    def test_gives_up_after_max_attempts(self):
+        results = [register_browser.SignupRateLimited("rate limited")] * 3
+        with self._patch(results):
+            out = register._run_one(
+                "first@example.org",
+                {"register_max_attempts": 3},
+                lambda m: None,
+                "",
+                "",
+                auth_client=None,
+                backend="browser",
+            )
+        self.assertIsNone(out)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_non_rate_limit_error_not_retried(self):
+        """普通失败只报一次，不重试（重试没有意义）。"""
+        results = [register_browser.BrowserRegisterError("boom")]
+        logs = []
+        with self._patch(results):
+            out = register._run_one(
+                "first@example.org",
+                {"register_max_attempts": 3},
+                logs.append,
+                "",
+                "",
+                auth_client=None,
+                backend="browser",
+            )
+        self.assertIsNone(out)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(any("boom" in line for line in logs))
+
+    def test_signup_not_created_is_retried(self):
+        """注册页报错（账号没建好）也要换邮箱重试。"""
+        results = [
+            register_browser.SignupNotCreated("unexpected error"),
+            ({"email": "u@example.org", "password": "p"}, {}),
+        ]
+        with self._patch(results):
+            out = register._run_one(
+                "first@example.org",
+                {"register_max_attempts": 5},
+                lambda m: None,
+                "",
+                "",
+                auth_client=None,
+                backend="browser",
+            )
+        self.assertEqual(out[0]["email"], "u@example.org")
+        self.assertEqual(self.calls, ["first@example.org", None])
 
 
 if __name__ == "__main__":

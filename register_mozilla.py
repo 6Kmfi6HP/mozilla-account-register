@@ -48,7 +48,7 @@ def register_one(
 
     provider = mail_service.get_email_provider()
     if email is None:
-        if provider == "cloudmail":
+        if provider in ("cloudmail", "emailnator"):
             email, credential = mail_service.get_email_and_token()
             log(f"[*] 已生成临时邮箱: {email}")
         else:
