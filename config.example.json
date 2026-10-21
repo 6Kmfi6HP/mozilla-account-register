@@ -8,6 +8,7 @@
   "proxy": "",
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
   "service": "sync",
+  "register_backend": "api",
   "register_count": 1,
   "register_threads": 1,
   "thread_start_interval": 3,
@@ -18,5 +19,8 @@
   "request_timeout": 30,
   "account_hard_timeout": 900,
   "emails_file": "",
-  "password_prefix": "Moz!"
+  "password_prefix": "Moz!",
+  "fxpool_enroll": false,
+  "fxpool_root": "",
+  "bundle_dir": ""
 }

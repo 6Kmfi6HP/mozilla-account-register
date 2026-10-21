@@ -232,22 +232,40 @@ def cloudmail_get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    ignore_ids=None,
+    ignore_codes=None,
+    code_shape=None,
 ) -> str:
-    """轮询 Cloud Mail，返回邮件正文中提取到的验证码。"""
+    """轮询 Cloud Mail，返回邮件正文中提取到的验证码。
+
+    ``ignore_ids`` / ``ignore_codes`` 用于登录已有账号时排除流程开始前就已在
+    邮箱里的旧验证码（旧注册邮件与新登录码都是 6 位数字）。集合按引用使用，
+    重发回调可以在轮询过程中继续往里加 id。``code_shape`` 指定期望的验证码
+    形状（``digits6`` / ``alnum8``），None 保持原有 6 位数字提取逻辑。
+    """
     _ = dev_token  # cloudmail 使用配置中的公共 Token
+    ignored_ids = ignore_ids if ignore_ids is not None else ()
+    ignored_codes = ignore_codes if ignore_codes is not None else ()
     deadline = time.time() + timeout
     seen_attempts: Dict[str, int] = {}
     next_resend_at = time.time() + 35
+    resends = 0
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         if resend_callback and time.time() >= next_resend_at:
+            clicked = False
             try:
-                resend_callback()
-                if log_callback:
+                clicked = bool(resend_callback())
+                if log_callback and clicked:
                     log_callback("[*] 已触发重新发送验证码")
             except Exception as exc:
                 if log_callback:
                     log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            if clicked:
+                resends += 1
+                if resends <= 2:
+                    # 重发会作废旧码，同时把截止时间顺延一个窗口。
+                    deadline = max(deadline, time.time() + min(float(timeout), 120.0))
             next_resend_at = time.time() + 35
         try:
             messages = cloudmail_get_messages(email)
@@ -261,6 +279,9 @@ def cloudmail_get_oai_code(
         for msg in messages:
             msg_id = msg.get("emailId") or msg.get("email_id") or msg.get("id")
             if not msg_id:
+                continue
+            if str(msg_id) in ignored_ids:
+                # 流程开始前（或重发前）就存在的邮件：其中的码已经失效。
                 continue
             attempt = int(seen_attempts.get(msg_id, 0))
             if attempt >= 5:
@@ -281,7 +302,11 @@ def cloudmail_get_oai_code(
             subject = str(msg.get("subject", "") or "")
             if log_callback:
                 log_callback(f"[Debug] Cloud Mail 收到邮件: {subject}")
-            code = extract_verification_code(combined, subject)
+            code = extract_code(combined, subject, code_shape)
+            if code and code in ignored_codes:
+                if log_callback:
+                    log_callback(f"[Debug] 跳过已尝试过的验证码 id={msg_id}")
+                continue
             if code:
                 if log_callback:
                     log_callback(f"[*] Cloud Mail 从邮件中提取到验证码: {code}")
@@ -293,6 +318,29 @@ def cloudmail_get_oai_code(
                 )
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"Cloud Mail 在 {timeout}s 内未收到验证码邮件")
+
+
+def snapshot_mail_ids(email: str) -> set:
+    """返回邮箱中当前已有邮件的 id 集合（尽力而为，失败时返回空集）。
+
+    登录已有账号前先做快照，轮询时用 ``ignore_ids`` 排除旧邮件，避免把上次
+    注册/登录留下的验证码当成新码提交。
+    """
+    provider = get_email_provider()
+    if provider != "cloudmail":
+        return set()
+    try:
+        messages = cloudmail_get_messages(email)
+    except Exception:
+        return set()
+    ids = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        msg_id = msg.get("emailId") or msg.get("email_id") or msg.get("id")
+        if msg_id:
+            ids.add(str(msg_id))
+    return ids
 
 
 # ---------------------------------------------------------------- dispatch
@@ -320,6 +368,9 @@ def get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    ignore_ids=None,
+    ignore_codes=None,
+    code_shape=None,
 ) -> str:
     provider = get_email_provider()
     if provider == "cloudmail":
@@ -331,6 +382,9 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+            ignore_ids=ignore_ids,
+            ignore_codes=ignore_codes,
+            code_shape=code_shape,
         )
     raise Exception(f"未实现的 email_provider: {provider}")
 
@@ -373,6 +427,62 @@ def extract_verification_code(text: str, subject: str = "") -> Optional[str]:
         code = _pick(source, digit_contextual)
         if code:
             return code
+    return None
+
+
+def extract_code(text: str, subject: str = "", shape: Optional[str] = None) -> Optional[str]:
+    """按页面要求的形状提取验证码。
+
+    ``shape=None`` 时保持原有行为（委托 ``extract_verification_code``）。
+    ``digits6``：恰好 6 位数字（confirm_signup_code / signin_token_code）。
+    ``alnum8``：8 位字母数字（signin_unblock 的 authorization code），
+    输入框只接受 8 位，所以 4-4 分组会去掉连字符。
+    """
+    if shape is None:
+        return extract_verification_code(text, subject)
+
+    subject = str(subject or "")
+    text = str(text or "")
+    subject = re.sub(r"https?://[^\s'\"<>]+", " ", subject, flags=re.IGNORECASE)
+    text = re.sub(r"https?://[^\s'\"<>]+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    if shape == "digits6":
+        patterns = [
+            r"(?:confirmation|verification|confirm|sign[- ]?in)\s+code(?:\s+is)?[:\s]+(\d{6})\b",
+            r"your\s+(?:verification\s+)?code(?:\s+is)?[:\s]+(\d{6})\b",
+            r"use\s+(?:this\s+)?code(?:\s+is)?[:\s]+(\d{6})\b",
+            r"code(?:\s+is)?[:\s]+(\d{6})\b",
+            r"\b(\d{6})\b",
+        ]
+    elif shape == "alnum8":
+        # 至少含一个数字和一个字母，避免把普通英文单词当成验证码。
+        alnum8 = r"(?=[A-Za-z0-9]{0,7}\d)(?=[A-Za-z0-9]{0,7}[A-Za-z])[A-Za-z0-9]{8}"
+        patterns = [
+            r"authorization\s+code(?:\s+(?:is|you\s+need))?[:\s]+(" + alnum8 + r")\b",
+            r"here\s+is\s+the\s+authorization\s+code[^A-Za-z0-9]{0,30}(" + alnum8 + r")\b",
+            r"use\s+([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\s+to\s+sign\s+in",
+            r"use\s+(" + alnum8 + r")\s+to\s+sign\s+in",
+            r"code(?:\s+is)?[:\s]+(" + alnum8 + r")\b",
+            r"\b([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\b",
+        ]
+    else:
+        return extract_verification_code(text, subject)
+
+    for source in (subject, text):
+        for pattern in patterns:
+            match = re.search(pattern, source, re.MULTILINE | re.IGNORECASE)
+            if match:
+                value = match.group(1)
+                if shape == "alnum8":
+                    # 授权码必须字母数字混合；纯数字（如 2026-1020 日期）不是码。
+                    if not (re.search(r"[A-Za-z]", value) and re.search(r"\d", value)):
+                        continue
+                    return re.sub(r"[^A-Za-z0-9]", "", value)
+                return value
     return None
 
 

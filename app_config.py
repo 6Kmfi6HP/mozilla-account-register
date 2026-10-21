@@ -34,6 +34,11 @@ DEFAULT_CONFIG = {
     # 邮箱列表批量模式
     "emails_file": "",
     "password_prefix": "Moz!",
+    # 浏览器后端 / fxpool 凭据桥接
+    "register_backend": "api",
+    "fxpool_enroll": False,
+    "fxpool_root": "",
+    "bundle_dir": "",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -119,6 +124,16 @@ def validate_config(cfg=None):
     provider = str(data.get("email_provider", "cloudmail") or "cloudmail").strip().lower()
     if provider not in ("cloudmail", "duckmail", "yyds", "cloudflare", "manual"):
         raise ConfigError(f"不支持的 email_provider: {provider}")
+    # 新增键只在出现时做类型校验，兼容直接传 dict 的调用方
+    if "register_backend" in data:
+        backend = str(data["register_backend"]).strip().lower()
+        if backend not in ("api", "browser"):
+            raise ConfigError("配置项 register_backend 必须是 api 或 browser")
+    if "fxpool_enroll" in data and type(data["fxpool_enroll"]) is not bool:
+        raise ConfigError("配置项 fxpool_enroll 必须是布尔值 true/false")
+    for key in ("fxpool_root", "bundle_dir"):
+        if key in data and not isinstance(data[key], str):
+            raise ConfigError(f"配置项 {key} 必须是字符串")
     return data
 
 
