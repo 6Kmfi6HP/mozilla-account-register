@@ -66,7 +66,7 @@ python register.py --backend browser --count 3
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `email_provider` | 是 | `cloudmail`（默认）或 `emailnator`（临时 Gmail） |
+| `email_provider` | 是 | `cloudmail`（默认）、`emailnator`（临时 Gmail）、`duckmail`、`yyds`、`cloudflare` 或 `manual` |
 | `cloudmail_api_base` | 是 | Cloud Mail 服务地址（`cloudmail` 时必填） |
 | `cloudmail_public_token` | 是 | Cloud Mail 公共 Token（`cloudmail` 时必填） |
 | `cloudmail_domains` | 是 | 收件域名，逗号分隔（随机轮换生成邮箱） |
@@ -78,15 +78,20 @@ python register.py --backend browser --count 3
 | `auth_base` | 否 | Mozilla Auth Server，默认 `https://api.accounts.firefox.com/v1` |
 | `proxy` | 否 | HTTP 代理（批量高频时建议用代理池） |
 | `browser_proxy` | 否 | 浏览器后端专用代理（优先级：`browser_proxy` > `proxy` > `$BROWSER_PROXY`）。**批量注册必填**——FxA 按出口 IP 限速 |
+| `user_agent` | 否 | 浏览器 User-Agent，默认 Chrome 138 Windows |
+| `service` | 否 | FxA 注册关联的服务，默认 `sync` |
 | `register_backend` | 否 | `api`（默认）或 `browser` |
 | `register_count` | 否 | 自动生成邮箱时注册数量 |
 | `register_threads` | 否 | 并发线程数 |
+| `thread_start_interval` | 否 | 多线程时各线程的错峰启动间隔（秒），默认 3 |
 | `register_max_attempts` | 否 | 单个账号被限速时的最大重试次数（每次重试换邮箱 + 换出口 IP），默认 10 |
 | `mail_timeout` | 否 | 等待验证码超时（秒） |
 | `mail_poll_interval` | 否 | 邮箱轮询间隔（秒） |
 | `mail_retry_count` | 否 | emailnator CLI 传输层失败（SSL 断连/超时）的重试次数，默认 3 |
+| `request_timeout` | 否 | HTTP 请求超时（秒），默认 30 |
 | `account_hard_timeout` | 否 | 单个账号的总时长上限（秒），默认 900；限速重试受它约束 |
 | `emails_file` | 否 | 邮箱列表文件路径（也支持 `--emails` CLI 参数） |
+| `password_prefix` | 否 | 自动生成密码的前缀，默认 `Moz!` |
 | `fxpool_enroll` | 否 | 注册/登录后执行一次性开通（仅浏览器后端；等价 `--enroll`） |
 | `fxpool_root` | 否 | 写入 `<PATH>/tokens/renewal_credentials.json`（仅浏览器后端；等价 `--fxpool-root`；也可用环境变量 `FXPOOL_ROOT`） |
 | `bundle_dir` | 否 | 为每个验证成功的账号写 `<DIR>/<uid>.json` 凭据包（API 和浏览器后端；等价 `--bundle-dir`，空=关闭） |
