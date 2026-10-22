@@ -631,9 +631,10 @@ class TestEmailnatorRetry(unittest.TestCase):
                 stdout=json.dumps({"ok": True, "address": "a@b.com"}), stderr=""
             )
 
-        with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(mail_service.time, "sleep"):
-                data = mail_service._emailnator_call("new-email", attempts=3)
+        with mock.patch("mail_service.os.path.isfile", return_value=True):
+            with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(mail_service.time, "sleep"):
+                    data = mail_service._emailnator_call("new-email", attempts=3)
         self.assertEqual(data["address"], "a@b.com")
         self.assertEqual(len(calls), 3)
 
@@ -646,10 +647,11 @@ class TestEmailnatorRetry(unittest.TestCase):
                 stderr="",
             )
 
-        with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(mail_service.time, "sleep"):
-                with self.assertRaises(Exception) as ctx:
-                    mail_service._emailnator_call("new-email", attempts=2)
+        with mock.patch("mail_service.os.path.isfile", return_value=True):
+            with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(mail_service.time, "sleep"):
+                    with self.assertRaises(Exception) as ctx:
+                        mail_service._emailnator_call("new-email", attempts=2)
         self.assertIn("SSLError", str(ctx.exception))
 
     def test_business_error_not_retried(self):
@@ -662,9 +664,10 @@ class TestEmailnatorRetry(unittest.TestCase):
                 stderr="",
             )
 
-        with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
-            with self.assertRaises(Exception) as ctx:
-                mail_service._emailnator_call("new-email", attempts=3)
+        with mock.patch("mail_service.os.path.isfile", return_value=True):
+            with mock.patch.object(mail_service.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(Exception) as ctx:
+                    mail_service._emailnator_call("new-email", attempts=3)
         self.assertEqual(len(calls), 1)
         self.assertIn("邮箱已存在", str(ctx.exception))
 
