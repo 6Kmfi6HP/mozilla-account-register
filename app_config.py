@@ -29,7 +29,6 @@ DEFAULT_CONFIG = {
     "browser_proxy": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # 注册参数
-    "service": "sync",
     "register_count": 1,
     "register_threads": 1,
     "thread_start_interval": 3,
@@ -38,13 +37,11 @@ DEFAULT_CONFIG = {
     "mail_timeout": 180,
     "mail_poll_interval": 3,
     "mail_retry_count": 3,
-    "request_timeout": 30,
     "account_hard_timeout": 900,
     # 邮箱列表批量模式
     "emails_file": "",
-    "password_prefix": "Moz!",
     # 浏览器后端 / fxpool 凭据桥接
-    "register_backend": "api",
+    "register_backend": "browser",
     "fxpool_enroll": False,
     "fxpool_root": "",
     "bundle_dir": "",
@@ -137,7 +134,7 @@ def validate_config(cfg=None):
     if "register_backend" in data:
         backend = str(data["register_backend"]).strip().lower()
         if backend not in ("api", "browser"):
-            raise ConfigError("配置项 register_backend 必须是 api 或 browser")
+            raise ConfigError("配置项 register_backend 必须是 browser")
     if "fxpool_enroll" in data and type(data["fxpool_enroll"]) is not bool:
         raise ConfigError("配置项 fxpool_enroll 必须是布尔值 true/false")
     for key in ("fxpool_root", "bundle_dir", "emailnator_state_dir", "emailnator_code_pattern"):

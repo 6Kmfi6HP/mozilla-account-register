@@ -1,4 +1,4 @@
-"""Network-free API batch registration to fxpool bundle integration tests."""
+"""Network-free browser batch registration to fxpool bundle integration tests."""
 import contextlib
 import io
 import json
@@ -11,6 +11,7 @@ from unittest import mock
 import import_bundles
 import mail_service
 import register
+import register_browser
 import fxpool_bridge
 
 
@@ -27,42 +28,60 @@ ACCOUNTS = {
 }
 
 
-class FakeMozillaAuthClient:
-    def __init__(self, **_kwargs):
-        self.closed = False
-
-    def account_create(self, email, _auth_pw, service="sync"):
-        self.service = service
-        return dict(ACCOUNTS[email])
-
-    def recovery_email_verify_code(self, uid, code):
-        self.verified = (uid, code)
-        return {}
-
-    def close(self):
-        self.closed = True
-
-
 def _mode(path):
     return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def _fake_register_one_browser(
+    email,
+    password,
+    config,
+    log_callback,
+    on_account_created=None,
+    **options,
+):
+    if on_account_created:
+        on_account_created(email, password)
+    account = ACCOUNTS[email]
+    result = {
+        "email": email,
+        "password": password,
+        "uid": account["uid"],
+        "session_token": account["sessionToken"],
+        "enrolled": False,
+        "bundle_path": None,
+        "credentials_path": None,
+    }
+    if options.get("bridge") and options.get("bundle_dir"):
+        try:
+            paths = fxpool_bridge.publish_credentials(
+                email,
+                account["uid"],
+                account["sessionToken"],
+                bundle_dir=options["bundle_dir"],
+                fxpool_root=options.get("fxpool_root"),
+            )
+            result["bundle_path"] = paths.get("bundle_path")
+        except Exception as exc:
+            log_callback(f"[!] bridge: {exc}")
+    return result
 
 
 class TestRegisterBatchBundles(unittest.TestCase):
     def _config(self):
         return {
             "email_provider": "manual",
-            "service": "sync",
-            "request_timeout": 1,
             "mail_timeout": 1,
             "mail_poll_interval": 1,
+            "register_max_attempts": 1,
         }
 
     def _run_batch(self, temp_dir, fxpool_options, logs=None):
         if logs is None:
             logs = []
         with mock.patch.object(
-            register.mozilla_api, "MozillaAuthClient", FakeMozillaAuthClient
-        ), mock.patch.object(mail_service, "get_oai_code", return_value="123456"):
+            register_browser, "register_one_browser", side_effect=_fake_register_one_browser
+        ), mock.patch.object(mail_service, "prepare_mail_baseline"):
             count = register.register_batch(
                 EMAILS,
                 self._config(),
@@ -71,12 +90,11 @@ class TestRegisterBatchBundles(unittest.TestCase):
                 mail_credential_dir=temp_dir,
                 threads=1,
                 thread_start_interval=0,
-                backend="api",
                 fxpool_options=fxpool_options,
             )
         return count
 
-    def test_api_batch_writes_importable_bundles(self):
+    def test_browser_batch_writes_importable_bundles(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             bundle_dir = os.path.join(temp_dir, "bundles")
             fxpool_root = os.path.join(temp_dir, "fxpool")

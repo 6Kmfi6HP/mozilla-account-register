@@ -252,47 +252,35 @@ class TestCliGuard(unittest.TestCase):
                 return code, out.getvalue(), err.getvalue()
             return code, err.getvalue()
 
-    def test_config_fxpool_root_is_inert_on_api_backend(self):
-        code, _ = self._run({"fxpool_root": "/tmp/pool"})
+    def test_explicit_api_backend_flag_rejected(self):
+        code, err = self._run({}, "--backend", "api")
+        self.assertEqual(code, 2)
+        self.assertIn("API 注册后端已废弃并移除", err)
+
+    def test_explicit_browser_backend_accepted(self):
+        code, _ = self._run({}, "--backend", "browser")
         self.assertEqual(code, 0)
 
-    def test_api_config_warning_mentions_only_fxpool_root(self):
-        code, out, _ = self._run(
-            {"fxpool_root": "/tmp/pool", "bundle_dir": "/tmp/bundles"},
-            capture_output=True,
-        )
+    def test_legacy_api_config_warns_and_continues(self):
+        code, out, _ = self._run({"register_backend": "api"}, capture_output=True)
         self.assertEqual(code, 0)
-        self.assertIn("fxpool_root", out)
-        self.assertNotIn("bundle_dir", out)
+        self.assertIn("register_backend=api 已废弃", out)
 
-    def test_explicit_fxpool_root_requires_browser_backend(self):
-        code, err = self._run({}, "--fxpool-root", "/tmp/pool")
-        self.assertEqual(code, 2)
-        self.assertIn("--backend browser", err)
-
-    def test_config_enroll_requires_browser_backend(self):
-        code, err = self._run({"fxpool_enroll": True})
-        self.assertEqual(code, 2)
-        self.assertIn("fxpool_enroll", err)
-    def test_api_accepts_bundle_dir(self):
-        code, err = self._run({}, "--bundle-dir", "/tmp/bundles")
+    def test_default_run_accepts_fxpool_root(self):
+        code, _ = self._run({}, "--fxpool-root", "/tmp/pool")
         self.assertEqual(code, 0)
-        self.assertNotIn("需要 --backend browser", err)
 
-    def test_api_accepts_no_bridge(self):
-        code, err = self._run({}, "--no-bridge")
+    def test_default_run_accepts_enroll(self):
+        code, _ = self._run({}, "--enroll")
         self.assertEqual(code, 0)
-        self.assertNotIn("需要 --backend browser", err)
 
-    def test_explicit_enroll_requires_browser_backend(self):
-        code, err = self._run({}, "--enroll")
-        self.assertEqual(code, 2)
-        self.assertIn("--backend browser", err)
+    def test_default_run_accepts_bundle_dir(self):
+        code, _ = self._run({}, "--bundle-dir", "/tmp/bundles")
+        self.assertEqual(code, 0)
 
-    def test_explicit_signin_requires_browser_backend(self):
-        code, err = self._run({}, "--signin")
-        self.assertEqual(code, 2)
-        self.assertIn("--backend browser", err)
+    def test_default_run_accepts_no_bridge(self):
+        code, _ = self._run({}, "--no-bridge")
+        self.assertEqual(code, 0)
 
 
 class _FakeResponse:
@@ -702,8 +690,6 @@ class TestRateLimitedRetry(unittest.TestCase):
                 lambda m: None,
                 "",
                 "",
-                auth_client=None,
-                backend="browser",
             )
         self.assertEqual(out[0]["email"], "u@example.org")
         # 第二次必须换邮箱（服务端并没有为第一个邮箱建号）。
@@ -718,8 +704,6 @@ class TestRateLimitedRetry(unittest.TestCase):
                 lambda m: None,
                 "",
                 "",
-                auth_client=None,
-                backend="browser",
             )
         self.assertIsNone(out)
         self.assertEqual(len(self.calls), 3)
@@ -735,8 +719,6 @@ class TestRateLimitedRetry(unittest.TestCase):
                 logs.append,
                 "",
                 "",
-                auth_client=None,
-                backend="browser",
             )
         self.assertIsNone(out)
         self.assertEqual(len(self.calls), 1)
@@ -755,8 +737,6 @@ class TestRateLimitedRetry(unittest.TestCase):
                 lambda m: None,
                 "",
                 "",
-                auth_client=None,
-                backend="browser",
             )
         self.assertEqual(out[0]["email"], "u@example.org")
         self.assertEqual(self.calls, ["first@example.org", None])

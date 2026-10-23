@@ -2,21 +2,20 @@
 """Mozilla 账号注册机入口（CLI）。
 
 支持：
-  - 自动生成临时邮箱（cloudmail）+ 随机密码 注册 N 个账号
+  - 自动生成临时邮箱（cloudmail / emailnator）+ 随机密码 注册 N 个账号
   - 从 CSV/文本文件读取邮箱列表批量注册（每行一个邮箱）
-  - API/浏览器后端注册后把 FxA 会话桥接给 fxpool-proxy（凭据包 / renewal_credentials.json）
+  - 注册后把 FxA 会话桥接给 fxpool-proxy（凭据包 / renewal_credentials.json）
   - 用已有账号登录（--signin）只生成会话，不创建账号
   - 并发控制（register_threads）
 
 用法：
-  python register.py                       # 按 config.json 注册 register_count 个（API 后端）
+  python register.py                       # 按 config.json 注册 register_count 个
   python register.py --count 5             # 注册 5 个
   python register.py --emails emails.txt   # 批量注册文件中的邮箱
   python register.py --emails emails.txt --bundle-dir fxpool-bundles
-  python register.py --backend browser     # 用浏览器后端（绕过生产 WAF，需 cloakbrowser）
-  python register.py --backend browser --enroll --fxpool-root ~/.fxpool
-  python register.py --backend browser --signin --emails accounts.txt
-  python register.py --dry-run             # 只跑派生+参数校验，不发请求
+  python register.py --enroll --fxpool-root ~/.fxpool
+  python register.py --signin --emails accounts.txt
+  python register.py --dry-run             # 只跑配置校验与依赖检查，不发请求
 """
 from __future__ import annotations
 
@@ -34,10 +33,7 @@ from typing import Callable, List, Optional, Tuple
 from app_config import load_config, validate_config
 from app_paths import default_accounts_path
 import mail_service
-import mozilla_api
 import register_browser
-import fxpool_bridge
-from register_mozilla import register_one
 _LOCK = threading.Lock()
 _OUTPUT_LINE_PREFIXES = ("[+]", "[*]", "[!]", "[Debug]", "---")
 
@@ -178,91 +174,62 @@ def _run_one(
     log: Callable[[str], None],
     account_path: str,
     mail_credential_dir: str,
-    auth_client: Optional[mozilla_api.MozillaAuthClient],
-    backend: str = "api",
     fxpool_options: Optional[dict] = None,
     signin: bool = False,
     password: Optional[str] = None,
 ):
     try:
-        if backend == "browser":
-            options = dict(fxpool_options or {})
-            if signin:
-                if not email or password is None:
-                    raise ValueError("--signin 需要 email----password 账号行")
-                result = register_browser.ensure_session_browser(
-                    email=email,
-                    password=password,
-                    config=config,
-                    log_callback=log,
-                    **options,
-                )
-                _log_browser_outputs(result, log)
-                return result
+        options = dict(fxpool_options or {})
+        if signin:
+            if not email or password is None:
+                raise ValueError("--signin 需要 email----password 账号行")
+            result = register_browser.ensure_session_browser(
+                email=email,
+                password=password,
+                config=config,
+                log_callback=log,
+                **options,
+            )
+            _log_browser_outputs(result, log)
+            return result
 
-            max_attempts = max(1, int(config.get("register_max_attempts", 1) or 1))
-            hard_timeout = float(config.get("account_hard_timeout", 0) or 0)
-            deadline = time.time() + hard_timeout if hard_timeout > 0 else None
-            attempt = 0
-            while True:
-                attempt += 1
-                try:
-                    result, _created = _register_one_browser_attempt(
-                        email,
-                        config,
-                        log,
-                        account_path,
-                        mail_credential_dir,
-                        options,
-                    )
-                except (
-                    register_browser.SignupRateLimited,
-                    register_browser.SignupNotCreated,
-                ) as exc:
-                    # 这两类失败都发生在"账号在服务端建好"之前：换邮箱 + 换出口
-                    # IP（代理每次新建连接都会换 IP）重试是安全的。
-                    if attempt >= max_attempts:
-                        log(f"[!] 注册失败 {email or '?'}: {exc}")
-                        return None
-                    if deadline is not None and time.time() >= deadline:
-                        log(f"[!] 注册失败 {email or '?'}: 超过账号硬超时 {hard_timeout:.0f}s")
-                        return None
-                    reason = (
-                        "出口 IP 被限速"
-                        if isinstance(exc, register_browser.SignupRateLimited)
-                        else "注册页报错"
-                    )
-                    log(f"[!] {reason}（第 {attempt}/{max_attempts} 次），换 IP 与邮箱重试")
-                    email = None
-                    continue
-                _log_browser_outputs(result, log)
-                return result
-
-        result = register_one(
-            email=email,
-            password=None,
-            config=config,
-            auth_client=auth_client,
-            log_callback=log,
-            account_path=account_path,
-            mail_credential_dir=mail_credential_dir,
-        )
-        fxpool_options = dict(fxpool_options or {})
-        if fxpool_options.get("bridge") and fxpool_options.get("bundle_dir"):
+        max_attempts = max(1, int(config.get("register_max_attempts", 1) or 1))
+        hard_timeout = float(config.get("account_hard_timeout", 0) or 0)
+        deadline = time.time() + hard_timeout if hard_timeout > 0 else None
+        attempt = 0
+        while True:
+            attempt += 1
             try:
-                paths = fxpool_bridge.publish_credentials(
-                    result["email"],
-                    result["uid"],
-                    result["session_token"],
-                    bundle_dir=fxpool_options["bundle_dir"],
+                result, _created = _register_one_browser_attempt(
+                    email,
+                    config,
+                    log,
+                    account_path,
+                    mail_credential_dir,
+                    options,
                 )
-            except Exception as exc:
-                log(f"[!] bridge: {exc}")
-            else:
-                bundle_path = paths.get("bundle_path")
-                if bundle_path:
-                    log(f"[+] 续期凭据包: {os.path.abspath(bundle_path)}")
-        return result
+            except (
+                register_browser.SignupRateLimited,
+                register_browser.SignupNotCreated,
+            ) as exc:
+                # 这两类失败都发生在"账号在服务端建好"之前：换邮箱 + 换出口
+                # IP（代理每次新建连接都会换 IP）重试是安全的。
+                if attempt >= max_attempts:
+                    log(f"[!] 注册失败 {email or '?'}: {exc}")
+                    return None
+                if deadline is not None and time.time() >= deadline:
+                    log(f"[!] 注册失败 {email or '?'}: 超过账号硬超时 {hard_timeout:.0f}s")
+                    return None
+                reason = (
+                    "出口 IP 被限速"
+                    if isinstance(exc, register_browser.SignupRateLimited)
+                    else "注册页报错"
+                )
+                log(f"[!] {reason}（第 {attempt}/{max_attempts} 次），换 IP 与邮箱重试")
+                email = None
+                continue
+            _log_browser_outputs(result, log)
+            return result
     except Exception as exc:
         action = "登录" if signin else "注册"
         log(f"[!] {action}失败 {email or '?'}: {exc}")
@@ -345,7 +312,6 @@ def register_batch(
     threads: int = 1,
     thread_start_interval: float = 3.0,
     cancel_callback: Optional[Callable[[], None]] = None,
-    backend: str = "api",
     fxpool_options: Optional[dict] = None,
     signin: bool = False,
 ) -> int:
@@ -353,8 +319,7 @@ def register_batch(
 
     emails 为 None 时按 config.register_count 生成临时邮箱；
     signin=True 时 emails 是 (email, password) 元组列表。
-    每线程一个 auth client（各自独立 Session/Cookie）；
-    backend=browser 时走 cloakbrowser 注册页（每线程独立浏览器实例）。
+    走 cloakbrowser 注册页（每线程独立浏览器实例）。
     """
     if signin:
         work: List = list(emails or [])
@@ -378,49 +343,35 @@ def register_batch(
 
     def worker():
         nonlocal index
-        client = None
-        if backend == "api":
-            client = mozilla_api.MozillaAuthClient(
-                base=config.get("auth_base", mozilla_api.AUTH_BASE),
-                user_agent=config.get("user_agent", ""),
-                proxy=config.get("proxy", ""),
-                timeout=int(config.get("request_timeout", 30) or 30),
+        while True:
+            with index_lock:
+                if index >= total:
+                    break
+                i = index
+                index += 1
+            item = work[i]
+            password = None
+            if signin:
+                email, password = item
+            else:
+                email = item
+            tlog = _thread_log_for(log, email or "auto")
+            # 并发启动间隔
+            if i > 0 and threads > 1:
+                time.sleep(thread_start_interval * (i % threads))
+            result = _run_one(
+                email,
+                config,
+                tlog,
+                account_path,
+                mail_credential_dir,
+                fxpool_options=fxpool_options,
+                signin=signin,
+                password=password,
             )
-        try:
-            while True:
-                with index_lock:
-                    if index >= total:
-                        break
-                    i = index
-                    index += 1
-                item = work[i]
-                password = None
-                if signin:
-                    email, password = item
-                else:
-                    email = item
-                tlog = _thread_log_for(log, email or "auto")
-                # 并发启动间隔
-                if i > 0 and threads > 1:
-                    time.sleep(thread_start_interval * (i % threads))
-                result = _run_one(
-                    email,
-                    config,
-                    tlog,
-                    account_path,
-                    mail_credential_dir,
-                    auth_client=client,
-                    backend=backend,
-                    fxpool_options=fxpool_options,
-                    signin=signin,
-                    password=password,
-                )
-                if result:
-                    with results_lock:
-                        results.append(result)
-        finally:
-            if client is not None:
-                client.close()
+            if result:
+                with results_lock:
+                    results.append(result)
 
     thread_list = []
     for _ in range(max(1, threads)):
@@ -434,15 +385,13 @@ def register_batch(
 
 
 def _dry_run(config: dict, log: Callable[[str], None]) -> int:
-    """只做参数校验与派生测试，不发任何网络请求、不写文件。"""
-    from mozilla_crypto import get_auth_pw
-
-    email = "dryrun@example.com"
-    pw = generate_password()
-    auth_pw = get_auth_pw(email, pw)
-    log(f"[*] 派生测试通过: email={email}")
-    log(f"[*] authPW={auth_pw[:16]}...")
-    log(f"[*] 配置合法，可开始注册（dry-run 未发请求）")
+    """只做配置校验与浏览器依赖检查，不发网络请求、不写文件。"""
+    try:
+        register_browser._ensure_cloakbrowser()
+        log("[*] 浏览器依赖 (cloakbrowser) 检查通过")
+    except Exception as exc:
+        log(f"[*] 浏览器依赖未就绪: {exc}")
+    log("[*] 配置合法，可开始注册（dry-run 未发请求）")
     return 0
 
 
@@ -455,8 +404,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "示例:\n"
             "  python register.py --count 3\n"
             "  python register.py --emails emails.txt --threads 2\n"
-            "  python register.py --backend browser --enroll --fxpool-root ~/.fxpool\n"
-            "  python register.py --backend browser --signin --emails accounts.txt\n"
+            "  python register.py --enroll --fxpool-root ~/.fxpool\n"
+            "  python register.py --signin --emails accounts.txt\n"
             "  python register.py --dry-run"
         ),
     )
@@ -469,12 +418,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--threads", type=int, default=None, help="并发线程数（覆盖配置）")
     parser.add_argument("--out", default=None, help="账号输出文件（默认 accounts_<时间戳>.txt）")
-    parser.add_argument("--dry-run", action="store_true", help="只校验配置与派生，不发请求")
+    parser.add_argument("--dry-run", action="store_true", help="只校验配置与依赖，不发请求")
     parser.add_argument(
         "--backend",
-        choices=("api", "browser"),
+        choices=("browser", "api"),
         default=None,
-        help="注册后端：api=纯 HTTP onepw 协议（默认，可能被 WAF 拦）；browser=cloakbrowser 注册页（需安装依赖）",
+        help="注册后端：默认 browser（api 已废弃并移除）",
     )
     parser.add_argument(
         "--enroll",
@@ -502,9 +451,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--signin",
         action="store_true",
-        help="只登录已有账号生成会话，不创建账号（需 --backend browser）",
+        help="只登录已有账号生成会话，不创建账号",
     )
     args = parser.parse_args(argv)
+
+    if args.backend == "api":
+        print(
+            "[!] API 注册后端已废弃并移除（Mozilla 线上已拦截纯 API 注册），现仅支持浏览器后端。请从命令中移除 --backend api。",
+            file=sys.stderr,
+        )
+        return 2
 
     config = load_config(path=args.config)
     try:
@@ -515,39 +471,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log = _ThreadLog()
 
+    cfg_backend = str(config.get("register_backend", "browser") or "browser").strip().lower()
+    if cfg_backend == "api":
+        log("[*] 提示: 配置中的 register_backend=api 已废弃，自动使用浏览器后端")
+
     if args.count is not None:
         config["register_count"] = args.count
     if args.threads is not None:
         config["register_threads"] = args.threads
 
-    backend = args.backend or str(config.get("register_backend", "api") or "api")
     fxpool_options = _resolve_fxpool_options(args, config)
-
-    # --enroll/--fxpool-root/--signin 只对浏览器后端有意义。这里只看显式传入的 CLI 参数：
-    # config.json 里的 fxpool_root 在 api 后端下应当是无害的，
-    # 不能因为配置里存在就让所有默认运行都退出 2。
-    explicit_browser_only = []
-    if args.enroll:
-        explicit_browser_only.append("--enroll")
-    if args.fxpool_root is not None and args.fxpool_root != "":
-        explicit_browser_only.append("--fxpool-root")
-    if args.signin:
-        explicit_browser_only.append("--signin")
-    if backend == "api" and explicit_browser_only:
-        print(
-            "[!] 这些选项需要 --backend browser: " + ", ".join(explicit_browser_only),
-            file=sys.stderr,
-        )
-        return 2
-    if backend == "api" and bool(config.get("fxpool_enroll", False)):
-        print(
-            "[!] 配置项 fxpool_enroll=true 需要 register_backend=browser "
-            "或 --backend browser",
-            file=sys.stderr,
-        )
-        return 2
-    if backend == "api" and config.get("fxpool_root"):
-        log("[!] 忽略配置项 fxpool_root：仅浏览器后端使用")
 
     email_list: Optional[List] = None
     if args.emails:
@@ -595,12 +528,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         return _dry_run(config, log)
 
-    if backend == "browser":
-        try:
-            register_browser._ensure_cloakbrowser()
-        except Exception as exc:
-            print(f"[!] {exc}", file=sys.stderr)
-            return 2
+    try:
+        register_browser._ensure_cloakbrowser()
+    except Exception as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        return 2
 
     # 绑定运行时（mail_service 读 config）
     mail_service.bind_runtime({"config": config})
@@ -613,7 +545,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         log("[*] 模式: signin（登录已有账号生成会话，不写账号文件）")
     else:
         log(f"[*] 输出文件: {account_path}")
-    log(f"[*] 注册后端: {backend}")
+    log("[*] 注册后端: browser")
     threads = int(config.get("register_threads", 1) or 1)
     interval = float(config.get("thread_start_interval", 3) or 3)
 
@@ -625,7 +557,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         mail_credential_dir,
         threads=threads,
         thread_start_interval=interval,
-        backend=backend,
         fxpool_options=fxpool_options,
         signin=args.signin,
     )
